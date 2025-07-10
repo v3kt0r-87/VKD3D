@@ -129,6 +129,7 @@ static const struct vkd3d_optional_extension_info optional_device_extensions[] =
     VK_EXTENSION(AMD_DEVICE_COHERENT_MEMORY, AMD_device_coherent_memory),
     VK_EXTENSION(AMD_SHADER_CORE_PROPERTIES, AMD_shader_core_properties),
     VK_EXTENSION(AMD_SHADER_CORE_PROPERTIES_2, AMD_shader_core_properties2),
+    VK_EXTENSION(AMD_ANTI_LAG, AMD_anti_lag),
     /* NV extensions */
     VK_EXTENSION(NV_OPTICAL_FLOW, NV_optical_flow),
     VK_EXTENSION(NV_SHADER_SM_BUILTINS, NV_shader_sm_builtins),
@@ -641,6 +642,10 @@ static const struct vkd3d_instance_application_meta application_override[] = {
             VKD3D_CONFIG_FLAG_SMALL_VRAM_REBAR | VKD3D_CONFIG_FLAG_NO_STAGGERED_SUBMIT, 0 },
     /* Rise of the Tomb Raider. Game renders and samples a texture at the same time */
     { VKD3D_STRING_COMPARE_EXACT, "ROTTR.exe", VKD3D_CONFIG_FLAG_DISABLE_COLOR_COMPRESSION, 0 },
+    /* Death Stranding (Director's Cut and original). Massive CPU overhead due to reading from HVV in certain scenarios. */
+    /* EGS alias as well. */
+    { VKD3D_STRING_COMPARE_EXACT, "ds.exe", VKD3D_CONFIG_FLAG_NO_UPLOAD_HVV, 0 },
+    { VKD3D_STRING_COMPARE_EXACT, "DeathStranding.exe", VKD3D_CONFIG_FLAG_NO_UPLOAD_HVV, 0 },
     { VKD3D_STRING_COMPARE_NEVER, NULL, 0, 0 }
 };
 
@@ -2156,6 +2161,12 @@ static void vkd3d_physical_device_info_init(struct vkd3d_physical_device_info *i
         vk_prepend_struct(&info->features2, &info->cooperative_matrix2_features_nv);
     }
 
+    if (vulkan_info->AMD_anti_lag)
+    {
+        info->anti_lag_amd.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ANTI_LAG_FEATURES_AMD;
+        vk_prepend_struct(&info->features2, &info->anti_lag_amd);
+    }
+
     VK_CALL(vkGetPhysicalDeviceFeatures2(device->vk_physical_device, &info->features2));
     VK_CALL(vkGetPhysicalDeviceProperties2(device->vk_physical_device, &info->properties2));
 
@@ -3340,6 +3351,36 @@ static HRESULT vkd3d_select_queues(const struct d3d12_device *device,
     return S_OK;
 }
 
+static void d3d12_device_init_vendor_hacks(struct d3d12_device *device)
+{
+    /* We don't do anything with this library directly, but various AMD provided dlls
+     * like FSR and AntiLag check if amdxc64.dll is loaded, then attempt
+     * calling into it. On Proton, this DLL is purely a shim intended to forward calls
+     * to where they belong.
+     * This DLL is provided through external means (at least for now),
+     * but the logical thing to do is to load the DLL when the d3d12 device is created,
+     * since this is literally the name of the d3d12 driver on Windows.
+     * Don't bother with 32-bit since 32-bit d3d12 is not really a thing. */
+    (void)device;
+
+#ifdef _WIN64
+    if (device->device_info.properties2.properties.vendorID == 0x1002)
+    {
+        device->vendor_hacks.amdxc64 = LoadLibraryA("amdxc64.dll");
+        if (device->vendor_hacks.amdxc64)
+            INFO("Loaded amdxc64.dll successfully.\n");
+    }
+#endif
+}
+
+static void d3d12_device_cleanup_vendor_hacks(struct d3d12_device *device)
+{
+#ifdef _WIN64
+    if (device->vendor_hacks.amdxc64)
+        FreeLibrary(device->vendor_hacks.amdxc64);
+#endif
+}
+
 static void d3d12_device_init_workarounds(struct d3d12_device *device)
 {
     uint32_t major, minor, patch;
@@ -3537,6 +3578,7 @@ static HRESULT vkd3d_create_vk_device(struct d3d12_device *device,
     device->vk_info.extension_names = extensions;
 
     d3d12_device_init_workarounds(device);
+    d3d12_device_init_vendor_hacks(device);
 
     TRACE("Created Vulkan device %p.\n", vk_device);
 
@@ -3938,6 +3980,7 @@ void d3d12_device_return_query_pool(struct d3d12_device *device, const struct vk
 extern ULONG STDMETHODCALLTYPE d3d12_device_vkd3d_ext_AddRef(d3d12_device_vkd3d_ext_iface *iface);
 extern ULONG STDMETHODCALLTYPE d3d12_dxvk_interop_device_AddRef(d3d12_dxvk_interop_device_iface *iface);
 extern ULONG STDMETHODCALLTYPE d3d12_low_latency_device_AddRef(ID3DLowLatencyDevice *iface);
+extern ULONG STDMETHODCALLTYPE d3d12_amd_ext_anti_lag_AddRef(IAmdExtAntiLagApi *iface);
 
 HRESULT STDMETHODCALLTYPE d3d12_device_QueryInterface(d3d12_device_iface *iface,
         REFIID riid, void **object)
@@ -3991,6 +4034,19 @@ HRESULT STDMETHODCALLTYPE d3d12_device_QueryInterface(d3d12_device_iface *iface,
         d3d12_low_latency_device_AddRef(&device->ID3DLowLatencyDevice_iface);
         *object = &device->ID3DLowLatencyDevice_iface;
         return S_OK;
+    }
+
+    if (IsEqualGUID(riid, &IID_IAmdExtAntiLagApi))
+    {
+        /* Only expose the interface if we can support it. */
+        if (device->device_info.anti_lag_amd.antiLag && !device->vk_info.NV_low_latency2)
+        {
+            d3d12_amd_ext_anti_lag_AddRef(&device->IAmdExtAntiLagApi_iface);
+            *object = &device->IAmdExtAntiLagApi_iface;
+            return S_OK;
+        }
+        else
+            return E_NOINTERFACE;
     }
 
     if (IsEqualGUID(riid, &IID_ID3DDestructionNotifier))
@@ -4139,6 +4195,7 @@ static void d3d12_device_destroy(struct d3d12_device *device)
     d3d12_device_free_pipeline_libraries(device);
     /* Tear down descriptor global info late, so we catch last minute faults after we drain the queues. */
     vkd3d_descriptor_debug_free_global_info(device->descriptor_qa_global_info, device);
+    d3d12_device_cleanup_vendor_hacks(device);
 
 #ifdef VKD3D_ENABLE_RENDERDOC
     if (vkd3d_renderdoc_active() && vkd3d_renderdoc_global_capture_enabled())
@@ -9558,6 +9615,7 @@ static void d3d12_device_replace_vtable(struct d3d12_device *device)
 extern CONST_VTBL struct ID3D12DeviceExt1Vtbl d3d12_device_vkd3d_ext_vtbl;
 extern CONST_VTBL struct ID3D12DXVKInteropDevice1Vtbl d3d12_dxvk_interop_device_vtbl;
 extern CONST_VTBL struct ID3DLowLatencyDeviceVtbl d3d_low_latency_device_vtbl;
+extern CONST_VTBL struct IAmdExtAntiLagApiVtbl d3d_amd_ext_anti_lag_vtbl;
 
 static void vkd3d_scratch_pool_init(struct d3d12_device *device)
 {
@@ -9650,6 +9708,7 @@ static HRESULT d3d12_device_init(struct d3d12_device *device,
     device->ID3D12DeviceExt_iface.lpVtbl = &d3d12_device_vkd3d_ext_vtbl;
     device->ID3D12DXVKInteropDevice_iface.lpVtbl = &d3d12_dxvk_interop_device_vtbl;
     device->ID3DLowLatencyDevice_iface.lpVtbl = &d3d_low_latency_device_vtbl;
+    device->IAmdExtAntiLagApi_iface.lpVtbl = &d3d_amd_ext_anti_lag_vtbl;
 
     if ((rc = rwlock_init(&device->vertex_input_lock)))
     {
