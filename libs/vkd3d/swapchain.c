@@ -796,6 +796,13 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_ChangeProperties(IDXGIVkSwap
         chain->user.index = 0;
     }
 
+#ifndef _WIN32
+    /* Non-Win32 platforms (e.g. Wayland) may not be able to detect resizes on its own.
+     * We have drained the present queue at this point, so it's safe to poke this bool.
+     * If using native builds, it's up to the application to use ResizeBuffers properly. */
+    chain->present.force_swapchain_recreation = true;
+#endif
+
     return S_OK;
 }
 
@@ -896,6 +903,7 @@ static void dxgi_vk_swap_chain_set_hdr_metadata(struct dxgi_vk_swap_chain *chain
     VK_CALL(vkSetHdrMetadataEXT(chain->queue->device->vk_device, 1, &chain->present.vk_swapchain, &hdr_metadata));
 }
 
+#ifdef _WIN32
 static bool dxgi_vk_swap_chain_present_task_is_idle(struct dxgi_vk_swap_chain *chain)
 {
     uint64_t presented_count = vkd3d_atomic_uint64_load_explicit(&chain->present.present_count, vkd3d_memory_order_acquire);
@@ -912,9 +920,11 @@ static bool dxgi_vk_swap_chain_is_occluded(struct dxgi_vk_swap_chain *chain)
     /* Win32 jank, when these are 0 we cannot create a swapchain. */
     return surface_caps.maxImageExtent.width == 0 || surface_caps.maxImageExtent.height == 0;
 }
+#endif
 
 static bool dxgi_vk_swap_chain_present_is_occluded(struct dxgi_vk_swap_chain *chain)
 {
+#ifdef _WIN32
     if (dxgi_vk_swap_chain_present_task_is_idle(chain))
     {
         /* Query the surface directly. */
@@ -928,6 +938,11 @@ static bool dxgi_vk_swap_chain_present_is_occluded(struct dxgi_vk_swap_chain *ch
          * so rely on observed behavior from presentation thread. */
         return vkd3d_atomic_uint32_load_explicit(&chain->present.is_occlusion_state, vkd3d_memory_order_relaxed) != 0;
     }
+#else
+	/* Irrelevant on native build. */
+	(void)chain;
+	return false;
+#endif
 }
 
 static void dxgi_vk_swap_chain_present_callback(void *chain);
@@ -1826,7 +1841,11 @@ static void dxgi_vk_swap_chain_recreate_swapchain_in_present_task(struct dxgi_vk
 
     /* Sanity check, this cannot happen on Win32 surfaces, but could happen on Wayland. */
     if (surface_caps.currentExtent.width == UINT32_MAX || surface_caps.currentExtent.height == UINT32_MAX)
-        return;
+    {
+        /* TODO: Can add extended interface to query surface size. */
+        surface_caps.currentExtent.width = chain->desc.Width;
+        surface_caps.currentExtent.height = chain->desc.Height;
+    }
 
     /* No format to present to yet. Can happen in transition states for HDR.
      * Where we have modified color space, but not yet changed user backbuffer format. */

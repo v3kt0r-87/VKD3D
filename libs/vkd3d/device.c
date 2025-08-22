@@ -646,6 +646,12 @@ static const struct vkd3d_instance_application_meta application_override[] = {
     /* EGS alias as well. */
     { VKD3D_STRING_COMPARE_EXACT, "ds.exe", VKD3D_CONFIG_FLAG_NO_UPLOAD_HVV, 0 },
     { VKD3D_STRING_COMPARE_EXACT, "DeathStranding.exe", VKD3D_CONFIG_FLAG_NO_UPLOAD_HVV, 0 },
+    /* AC: Valhalla (2208920). Very ugly use-after-free in some cases. The main culprit seems a sparse resource. */
+    { VKD3D_STRING_COMPARE_EXACT, "ACValhalla.exe", VKD3D_CONFIG_FLAG_DEFER_RESOURCE_DESTRUCTION, 0 },
+    /* Endless Legend 2 (3407390) and its demo (3596660). Broken tessellation shaders with legacy compiler. */
+    { VKD3D_STRING_COMPARE_EXACT, "Endless Legend 2.exe", VKD3D_CONFIG_FLAG_ENABLE_DXBC_SPIRV, 0 },
+    /* Red Dead Redemption 2 (1174180). Broken shader compilation with legacy compiler. */
+    { VKD3D_STRING_COMPARE_EXACT, "RDR2.exe", VKD3D_CONFIG_FLAG_ENABLE_DXBC_SPIRV, 0 },
     { VKD3D_STRING_COMPARE_NEVER, NULL, 0, 0 }
 };
 
@@ -1006,6 +1012,7 @@ static void vkd3d_instance_apply_global_shader_quirks(void)
     static const struct override overrides[] =
     {
         { VKD3D_CONFIG_FLAG_FORCE_NO_INVARIANT_POSITION, VKD3D_SHADER_QUIRK_INVARIANT_POSITION, true },
+        { VKD3D_CONFIG_FLAG_ENABLE_DXBC_SPIRV, VKD3D_SHADER_QUIRK_DXBC_SPIRV, false },
     };
     uint64_t eq_test;
     unsigned int i;
@@ -1110,6 +1117,8 @@ static const struct vkd3d_debug_option vkd3d_config_options[] =
     {"skip_null_sparse_tiles", VKD3D_CONFIG_FLAG_SKIP_NULL_SPARSE_TILES},
     {"queue_profile_extra", VKD3D_CONFIG_FLAG_QUEUE_PROFILE_EXTRA},
     {"damage_not_zeroed_allocations", VKD3D_CONFIG_FLAG_DAMAGE_NOT_ZEROED_ALLOCATIONS},
+    {"defer_resource_destruction", VKD3D_CONFIG_FLAG_DEFER_RESOURCE_DESTRUCTION},
+    {"dxbc_spirv", VKD3D_CONFIG_FLAG_ENABLE_DXBC_SPIRV},
 };
 
 static void vkd3d_config_flags_init_once(void)
@@ -1118,6 +1127,12 @@ static void vkd3d_config_flags_init_once(void)
 
     vkd3d_get_env_var("VKD3D_CONFIG", config, sizeof(config));
     vkd3d_config_flags = vkd3d_parse_debug_options(config, vkd3d_config_options, ARRAY_SIZE(vkd3d_config_options));
+
+    if (vkd3d_debug_control_is_test_suite())
+    {
+        INFO("Running test suite, enabling dxbc-spirv.\n");
+        vkd3d_config_flags |= VKD3D_CONFIG_FLAG_ENABLE_DXBC_SPIRV;
+    }
 
     if (!(vkd3d_config_flags & VKD3D_CONFIG_FLAG_SKIP_APPLICATION_WORKAROUNDS))
         vkd3d_instance_apply_application_workarounds();
@@ -2724,8 +2739,20 @@ static bool vkd3d_supports_minimum_coopmat_caps(struct d3d12_device *device)
 
     if (!supports_8bit_c)
     {
-        WARN("8-bit Accumulator type not exposed, but assuming it works anyway. "
-             "This is required for FSR4 and happens to work in practice on AMD GPUs.\n");
+        switch (device->device_info.vulkan_1_2_properties.driverID)
+        {
+            case VK_DRIVER_ID_MESA_RADV:
+            case VK_DRIVER_ID_AMD_OPEN_SOURCE:
+            case VK_DRIVER_ID_AMD_PROPRIETARY:
+                WARN("8-bit Accumulator type not exposed, but assuming it works anyway. "
+                     "This is required for FSR4 and happens to work in practice on AMD GPUs.\n");
+                break;
+
+            default:
+                /* This is out of spec and known to segfault some drivers, so just don't bother.
+                 * FSR4 is only relevant on AMD GPUs anyway. */
+                return false;
+        }
     }
 
     return true;
@@ -3418,13 +3445,18 @@ static void d3d12_device_init_workarounds(struct d3d12_device *device)
     {
         if (vkd3d_get_linux_kernel_version(&major, &minor, &patch))
         {
+            uint32_t ver;
+
             /* 6.10 amdgpu kernel changes the clear vram code to do background clears instead
              * of on-demand clearing. This seems to have bugs, and we have been able to observe
              * non-zeroed VRAM coming from the affected kernels.
              * This workaround needs to be in place until we have confirmed a fix in upstream kernel. */
             INFO("Detected Linux kernel version %u.%u.%u\n", major, minor, patch);
 
-            if (major > 6 || (major == 6 && minor >= 10))
+            ver = major * 1000000 + minor * 1000 + patch;
+
+            /* Fixed in kernel 6.15.9 and 6.16+. */
+            if (ver >= 6010000 && ver < 6015009)
             {
                 INFO("AMDGPU broken kernel detected. Enabling manual memory clearing path.\n");
                 device->workarounds.amdgpu_broken_clearvram = true;
@@ -8473,15 +8505,24 @@ static D3D12_RESOURCE_HEAP_TIER d3d12_device_determine_heap_tier(struct d3d12_de
 {
     const VkPhysicalDeviceLimits *limits = &device->device_info.properties2.properties.limits;
     const struct vkd3d_memory_info *mem_info = &device->memory_info;
+    const struct vkd3d_memory_info_domain *fallback_domain;
     const struct vkd3d_memory_info_domain *non_cpu_domain;
 
     non_cpu_domain = &mem_info->non_cpu_accessible_domain;
+    fallback_domain = &mem_info->fallback_domain;
 
     /* Heap Tier 2 requires us to be able to create a heap that supports all resource
      * categories at the same time, except RT/DS textures on UPLOAD/READBACK heaps.
      * Ignore CPU visible heaps since we only place buffers there. Textures are promoted to committed always. */
-    if (limits->bufferImageGranularity > D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT ||
+    if ((limits->bufferImageGranularity > D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) ||
             !(non_cpu_domain->buffer_type_mask & non_cpu_domain->sampled_type_mask & non_cpu_domain->rt_ds_type_mask))
+        return D3D12_RESOURCE_HEAP_TIER_1;
+
+    /* If we don't have VK_EXT_pageable_device_memory, we're at the risk of needing to fallback allocate
+     * memory from sysmem when we run out.
+     * For HEAP_TIER_2 to work, we need to ensure there is a heap index which can support this use case as well. */
+    if (!device->device_info.pageable_device_memory_features.pageableDeviceLocalMemory &&
+            !(fallback_domain->buffer_type_mask & fallback_domain->sampled_type_mask & fallback_domain->rt_ds_type_mask))
         return D3D12_RESOURCE_HEAP_TIER_1;
 
     return D3D12_RESOURCE_HEAP_TIER_2;
@@ -8890,14 +8931,25 @@ static void d3d12_device_caps_init_feature_options20(struct d3d12_device *device
     options20->RecreateAtTier = D3D12_RECREATE_AT_TIER_NOT_SUPPORTED;
 }
 
+bool d3d12_device_supports_workgraphs(const struct d3d12_device *device)
+{
+    /* Thread nodes currently need wave32 to function correctly since the API limits for thread nodes
+     * match wave32 expectations (8 nodes per thread * 32 threads = 256 max nodes). */
+    return ((vkd3d_config_flags & VKD3D_CONFIG_FLAG_ENABLE_EXPERIMENTAL_FEATURES) ||
+            vkd3d_debug_control_is_test_suite()) &&
+            device->device_info.shader_maximal_reconvergence_features.shaderMaximalReconvergence &&
+            device->device_info.vulkan_1_2_features.vulkanMemoryModel &&
+            device->device_info.vulkan_1_3_features.subgroupSizeControl &&
+            (device->device_info.vulkan_1_3_properties.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT) &&
+            device->device_info.vulkan_1_3_properties.minSubgroupSize <= 32;
+}
+
 static void d3d12_device_caps_init_feature_options21(struct d3d12_device *device)
 {
     D3D12_FEATURE_DATA_D3D12_OPTIONS21 *options21 = &device->d3d12_caps.options21;
 
     /* Enable WGs in test suite to avoid bitrot. */
-    options21->WorkGraphsTier = ((vkd3d_config_flags & VKD3D_CONFIG_FLAG_ENABLE_EXPERIMENTAL_FEATURES) ||
-            vkd3d_debug_control_is_test_suite()) &&
-            device->device_info.shader_maximal_reconvergence_features.shaderMaximalReconvergence ?
+    options21->WorkGraphsTier = d3d12_device_supports_workgraphs(device) ?
             D3D12_WORK_GRAPHS_TIER_1_0 : D3D12_WORK_GRAPHS_TIER_NOT_SUPPORTED;
     options21->ExecuteIndirectTier = device->device_info.device_generated_commands_features_ext.deviceGeneratedCommands ?
             D3D12_EXECUTE_INDIRECT_TIER_1_1 : D3D12_EXECUTE_INDIRECT_TIER_1_0;

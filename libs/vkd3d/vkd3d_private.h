@@ -909,6 +909,11 @@ struct vkd3d_memory_allocator
     size_t chunks_count;
 
     struct vkd3d_va_map va_map;
+
+    /* For workaround purposes. Hold onto sparse resources in a ring buffer so that
+     * their VAs remain valid longer than they should. */
+    struct d3d12_resource *sparse_pending_destroy[32];
+    uint32_t sparse_pending_destroy_count;
 };
 
 void vkd3d_free_memory(struct d3d12_device *device, struct vkd3d_memory_allocator *allocator,
@@ -2076,6 +2081,7 @@ struct d3d12_graphics_pipeline_state_cached_desc
     D3D12_SHADER_BYTECODE bytecode[VKD3D_MAX_SHADER_STAGES];
     VkShaderStageFlagBits bytecode_stages[VKD3D_MAX_SHADER_STAGES];
     uint32_t bytecode_duped_mask;
+    uint32_t patch_location_offset;
 };
 
 struct d3d12_graphics_pipeline_state
@@ -3226,7 +3232,8 @@ enum vkd3d_submission_type
     VKD3D_SUBMISSION_EXECUTE,
     VKD3D_SUBMISSION_BIND_SPARSE,
     VKD3D_SUBMISSION_STOP,
-    VKD3D_SUBMISSION_CALLBACK,
+    VKD3D_SUBMISSION_QUEUE_USING_CALLBACK,
+    VKD3D_SUBMISSION_CPU_TIMELINE_CALLBACK,
     VKD3D_SUBMISSION_DRAIN
 };
 
@@ -4099,6 +4106,9 @@ struct vkd3d_memory_info
      * Used when we want to allocate DEFAULT heaps or non-visible CUSTOM heaps.
      * For images, we only include memory types which are OPTIMAL tiled. */
     struct vkd3d_memory_info_domain non_cpu_accessible_domain;
+    /* Same as non_cpu_accessible_domain, but removes memory types which belong to the primary device-local heap.
+     * On iGPU, fallback_domain == non_cpu_accessible_domain. */
+    struct vkd3d_memory_info_domain fallback_domain;
 
     VkMemoryPropertyFlags upload_heap_memory_properties;
     VkMemoryPropertyFlags descriptor_heap_memory_properties;
@@ -4897,7 +4907,6 @@ struct vkd3d_device_swapchain_info
 #define VKD3D_LOW_LATENCY_FRAME_ID_STRIDE 10000
 struct vkd3d_device_frame_markers
 {
-    UINT64 simulation;
     UINT64 render;
     UINT64 present;
     UINT64 consumed_present_id;
@@ -5272,6 +5281,8 @@ struct vkd3d_queue_family_info *d3d12_device_get_vkd3d_queue_family(struct d3d12
         uint32_t vk_family_index);
 struct vkd3d_queue *d3d12_device_allocate_vkd3d_queue(struct vkd3d_queue_family_info *queue_family,
         struct d3d12_command_queue *command_queue);
+void d3d12_device_add_queue_timeline_deferred_decref(struct d3d12_device *device,
+        void (*inc_call)(void *), void (*dec_call)(void *), void *userdata, bool postpone_decref);
 void d3d12_device_unmap_vkd3d_queue(struct vkd3d_queue *queue, struct d3d12_command_queue *command_queue);
 bool d3d12_device_is_uma(struct d3d12_device *device, bool *coherent);
 void d3d12_device_mark_as_removed(struct d3d12_device *device, HRESULT reason,
@@ -5358,14 +5369,14 @@ static inline uint32_t vkd3d_bindless_state_find_set_info_index_fast(struct d3d1
 
 static inline const struct vkd3d_memory_info_domain *d3d12_device_get_memory_info_domain(
         struct d3d12_device *device,
-        const D3D12_HEAP_PROPERTIES *heap_properties)
+        const D3D12_HEAP_PROPERTIES *heap_properties, bool fallback)
 {
     /* Host visible and non-host visible memory types do not necessarily
      * overlap. Need to select memory types appropriately. */
     if (is_cpu_accessible_heap(heap_properties))
         return &device->memory_info.cpu_accessible_domain;
     else
-        return &device->memory_info.non_cpu_accessible_domain;
+        return fallback ? &device->memory_info.fallback_domain : &device->memory_info.non_cpu_accessible_domain;
 }
 
 static inline HRESULT d3d12_device_query_interface(struct d3d12_device *device, REFIID iid, void **object)
@@ -5510,6 +5521,7 @@ bool d3d12_device_supports_ray_tracing_tier_1_2(const struct d3d12_device *devic
 UINT d3d12_determine_shading_rate_image_tile_size(struct d3d12_device *device);
 bool d3d12_device_supports_required_subgroup_size_for_stage(
         struct d3d12_device *device, VkShaderStageFlagBits stage);
+bool d3d12_device_supports_workgraphs(const struct d3d12_device *device);
 
 static inline void d3d12_device_register_swapchain(struct d3d12_device *device, struct dxgi_vk_swap_chain *chain)
 {

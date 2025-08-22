@@ -562,6 +562,7 @@ static const struct vkd3d_quirk_to_dxil_mapping
     { VKD3D_SHADER_QUIRK_ASSUME_BROKEN_SUB_8x8_CUBE_MIPS, DXIL_SPV_SHADER_QUIRK_ASSUME_BROKEN_SUB_8x8_CUBE_MIPS },
     { VKD3D_SHADER_QUIRK_FORCE_ROBUST_PHYSICAL_CBV_LOAD_FORWARDING, DXIL_SPV_SHADER_QUIRK_ROBUST_PHYSICAL_CBV_FORWARDING },
     { VKD3D_SHADER_QUIRK_AGGRESSIVE_NONUNIFORM, DXIL_SPV_SHADER_QUIRK_AGGRESSIVE_NONUNIFORM },
+    { VKD3D_SHADER_QUIRK_PROMOTE_GROUP_TO_DEVICE_MEMORY_BARRIER, DXIL_SPV_SHADER_QUIRK_PROMOTE_GROUP_TO_DEVICE_MEMORY_BARRIER },
 };
 
 static bool vkd3d_dxil_converter_set_quirks(dxil_spv_converter converter,
@@ -1124,7 +1125,7 @@ int vkd3d_shader_compile_dxil(const struct vkd3d_shader_code *dxbc,
         struct vkd3d_shader_code *spirv,
         struct vkd3d_shader_code_debug *spirv_debug,
         const struct vkd3d_shader_interface_info *shader_interface_info,
-        const struct vkd3d_shader_compile_arguments *compiler_args)
+        const struct vkd3d_shader_compile_arguments *compiler_args, bool is_dxil)
 {
     uint32_t wave_size_min, wave_size_max, wave_size_preferred;
     struct vkd3d_dxil_remap_userdata remap_userdata;
@@ -1170,7 +1171,7 @@ int vkd3d_shader_compile_dxil(const struct vkd3d_shader_code *dxbc,
 
     dxil_spv_begin_thread_allocator_context();
 
-    vkd3d_shader_dump_shader(hash, dxbc, "dxil");
+    vkd3d_shader_dump_shader(hash, dxbc, is_dxil ? "dxil" : "dxbc");
 
     if (dxil_spv_parse_dxil_blob(dxbc->code, dxbc->size, &blob) != DXIL_SPV_SUCCESS)
     {
@@ -1246,6 +1247,9 @@ int vkd3d_shader_compile_dxil(const struct vkd3d_shader_code *dxbc,
     if (shader_interface_info->stage_output_map)
         dxil_spv_converter_set_stage_output_remapper(converter, dxil_shader_stage_output_capture, (void *)shader_interface_info->stage_output_map);
 
+    if (stage == DXIL_SPV_STAGE_DOMAIN)
+        dxil_spv_converter_set_patch_location_offset(converter, shader_interface_info->patch_location_offset);
+
     if (dxil_spv_converter_run(converter) != DXIL_SPV_SUCCESS)
     {
         ret = VKD3D_ERROR_INVALID_ARGUMENT;
@@ -1289,6 +1293,13 @@ int vkd3d_shader_compile_dxil(const struct vkd3d_shader_code *dxbc,
             &spirv->meta.cs_workgroup_size[2]);
     dxil_spv_converter_get_patch_vertex_count(converter, &spirv->meta.patch_vertex_count);
 
+    if (stage == DXIL_SPV_STAGE_HULL)
+    {
+        unsigned int offset;
+        dxil_spv_converter_get_patch_location_offset(converter, &offset);
+        spirv->meta.patch_location_offset = offset;
+    }
+
     dxil_spv_converter_get_compute_wave_size_range(converter,
             &wave_size_min, &wave_size_max, &wave_size_preferred);
 
@@ -1303,6 +1314,8 @@ int vkd3d_shader_compile_dxil(const struct vkd3d_shader_code *dxbc,
 
         if (quirks & VKD3D_SHADER_QUIRK_FORCE_MAX_WAVE32)
             heuristic_max_wave_size = 32;
+        if (quirks & VKD3D_SHADER_QUIRK_FORCE_MIN_WAVE32)
+            heuristic_min_wave_size = 32;
 
         if (!wave_size_min)
         {

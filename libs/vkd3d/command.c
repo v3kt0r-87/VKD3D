@@ -2694,6 +2694,56 @@ struct vkd3d_queue_family_info *d3d12_device_get_vkd3d_queue_family(struct d3d12
     }
 }
 
+/* This is used for workaround purposes for when some games screw up use-after-free of in-flight resources.
+ * If resources are destroyed in-flight that's usually fine since GPU page tables are not updated
+ * while a submission is in flight, but since we thread the actual submissions, we might observe behavior
+ * that might not happen on Windows.
+ * For workaround purposes, it's enough that we just defer the actual final decref until all dependent
+ * vkQueueSubmit calls have gone through on CPU timeline.
+ * This can be extended as needed to deal with GPU timeline too, but that's only relevant if truly needed,
+ * since it will dramatically increase complexity and CPU overhead. */
+void d3d12_device_add_queue_timeline_deferred_decref(struct d3d12_device *device,
+        void (*inc_call)(void *), void (*dec_call)(void *), void *userdata, bool postpone_decref)
+{
+    struct vkd3d_queue_family_info *queue_family;
+    struct d3d12_command_queue_submission sub;
+    unsigned int i, j, family_index;
+    struct vkd3d_queue *vk_queue;
+
+    for (family_index = 0; family_index < ARRAY_SIZE(device->queue_families); family_index++)
+    {
+        queue_family = device->queue_families[family_index];
+        if (!queue_family)
+            continue;
+
+        /* Only use unique queue families. */
+        for (i = 0; i < family_index; i++)
+            if (device->queue_families[i] == queue_family)
+                break;
+
+        if (i < family_index)
+            continue;
+
+        for (i = 0; i < queue_family->queue_count; i++)
+        {
+            vk_queue = queue_family->queues[i];
+            pthread_mutex_lock(&vk_queue->mutex);
+            for (j = 0; j < vk_queue->command_queue_count; j++)
+            {
+                sub.type = VKD3D_SUBMISSION_CPU_TIMELINE_CALLBACK;
+                sub.callback.callback = dec_call;
+                sub.callback.userdata = userdata;
+                inc_call(userdata);
+                d3d12_command_queue_add_submission(vk_queue->command_queues[j], &sub);
+            }
+            pthread_mutex_unlock(&vk_queue->mutex);
+        }
+    }
+
+    if (!postpone_decref)
+        dec_call(userdata);
+}
+
 struct vkd3d_queue *d3d12_device_allocate_vkd3d_queue(struct vkd3d_queue_family_info *queue_family,
         struct d3d12_command_queue *command_queue)
 {
@@ -11217,9 +11267,19 @@ static void d3d12_command_list_set_push_descriptor_info(struct d3d12_command_lis
                     : vk_info->device_limits.maxStorageBufferRange;
 
             resource = vkd3d_va_map_deref(&list->device->memory_allocator.va_map, gpu_address);
-            descriptor->info.buffer.buffer = resource->vk_buffer;
-            descriptor->info.buffer.offset = gpu_address - resource->va;
-            descriptor->info.buffer.range = min(resource->size - descriptor->info.buffer.offset, max_range);
+
+            if (resource)
+            {
+                descriptor->info.buffer.buffer = resource->vk_buffer;
+                descriptor->info.buffer.offset = gpu_address - resource->va;
+                descriptor->info.buffer.range = min(resource->size - descriptor->info.buffer.offset, max_range);
+            }
+            else
+            {
+                descriptor->info.buffer.buffer = VK_NULL_HANDLE;
+                descriptor->info.buffer.offset = 0;
+                descriptor->info.buffer.range = VK_WHOLE_SIZE;
+            }
         }
         else
         {
@@ -11363,7 +11423,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_IASetIndexBuffer(d3d12_command_
 
     list->index_buffer.is_dirty = true;
 
-    if (!view)
+    if (!view || view->SizeInBytes == 0)
     {
         list->index_buffer.buffer = VK_NULL_HANDLE;
         VKD3D_BREADCRUMB_AUX32(0);
@@ -11391,9 +11451,17 @@ static void STDMETHODCALLTYPE d3d12_command_list_IASetIndexBuffer(d3d12_command_
     if (view->BufferLocation != 0)
     {
         resource = vkd3d_va_map_deref(&list->device->memory_allocator.va_map, view->BufferLocation);
-        list->index_buffer.buffer = resource->vk_buffer;
-        list->index_buffer.offset = view->BufferLocation - resource->va;
-        list->index_buffer.size = view->SizeInBytes;
+        if (resource)
+        {
+            list->index_buffer.buffer = resource->vk_buffer;
+            list->index_buffer.offset = view->BufferLocation - resource->va;
+            list->index_buffer.size = view->SizeInBytes;
+        }
+        else
+        {
+            WARN("Invalid VA lookup.\n");
+            list->index_buffer.buffer = VK_NULL_HANDLE;
+        }
     }
     else
         list->index_buffer.buffer = VK_NULL_HANDLE;
@@ -11513,13 +11581,32 @@ static void STDMETHODCALLTYPE d3d12_command_list_SOSetTargets(d3d12_command_list
         if (views[i].BufferLocation && views[i].SizeInBytes)
         {
             resource = vkd3d_va_map_deref(&list->device->memory_allocator.va_map, views[i].BufferLocation);
-            list->so_buffers[start_slot + i] = resource->vk_buffer;
-            list->so_buffer_offsets[start_slot + i] = views[i].BufferLocation - resource->va;
-            list->so_buffer_sizes[start_slot + i] = views[i].SizeInBytes;
+            if (resource)
+            {
+                list->so_buffers[start_slot + i] = resource->vk_buffer;
+                list->so_buffer_offsets[start_slot + i] = views[i].BufferLocation - resource->va;
+                list->so_buffer_sizes[start_slot + i] = views[i].SizeInBytes;
+            }
+            else
+            {
+                WARN("Invalid VA lookup.\n");
+                list->so_buffers[start_slot + i] = VK_NULL_HANDLE;
+                list->so_buffer_offsets[start_slot + i] = 0;
+                list->so_buffer_sizes[start_slot + i] = 0;
+            }
 
             resource = vkd3d_va_map_deref(&list->device->memory_allocator.va_map, views[i].BufferFilledSizeLocation);
-            list->so_counter_buffers[start_slot + i] = resource->vk_buffer;
-            list->so_counter_buffer_offsets[start_slot + i] = views[i].BufferFilledSizeLocation - resource->va;
+            if (resource)
+            {
+                list->so_counter_buffers[start_slot + i] = resource->vk_buffer;
+                list->so_counter_buffer_offsets[start_slot + i] = views[i].BufferFilledSizeLocation - resource->va;
+            }
+            else
+            {
+                WARN("Invalid VA lookup.\n");
+                list->so_counter_buffers[start_slot + i] = VK_NULL_HANDLE;
+                list->so_counter_buffer_offsets[start_slot + i] = 0;
+            }
         }
         else
         {
@@ -20159,7 +20246,7 @@ void d3d12_command_queue_submit_stop(struct d3d12_command_queue *queue)
 void d3d12_command_queue_enqueue_callback(struct d3d12_command_queue *queue, void (*callback)(void *), void *userdata)
 {
     struct d3d12_command_queue_submission sub;
-    sub.type = VKD3D_SUBMISSION_CALLBACK;
+    sub.type = VKD3D_SUBMISSION_QUEUE_USING_CALLBACK;
     sub.callback.callback = callback;
     sub.callback.userdata = userdata;
     d3d12_command_queue_add_submission(queue, &sub);
@@ -20354,10 +20441,15 @@ static void *d3d12_command_queue_submission_worker_main(void *userdata)
             pthread_mutex_unlock(&queue->queue_lock);
             break;
 
-        case VKD3D_SUBMISSION_CALLBACK:
+        case VKD3D_SUBMISSION_QUEUE_USING_CALLBACK:
             cookie = vkd3d_queue_timeline_trace_register_generic_region(&queue->device->queue_timeline_trace, "CALLBACK");
+            /* Only flush waiters if the callback intends to use the queue (for e.g. WSI). */
             d3d12_command_queue_flush_waiters(queue, VKD3D_WAIT_SEMAPHORES_EXTERNAL | VKD3D_WAIT_SEMAPHORES_SERIALIZING);
+            submission.callback.callback(submission.callback.userdata);
+            break;
 
+        case VKD3D_SUBMISSION_CPU_TIMELINE_CALLBACK:
+            cookie = vkd3d_queue_timeline_trace_register_generic_region(&queue->device->queue_timeline_trace, "CPU_CALLBACK");
             submission.callback.callback(submission.callback.userdata);
             break;
 

@@ -2007,6 +2007,36 @@ static ULONG STDMETHODCALLTYPE d3d12_resource_AddRef(d3d12_resource_iface *iface
     return refcount;
 }
 
+static void d3d12_resource_deferred_incref(void *userdata)
+{
+    struct d3d12_resource *resource = userdata;
+    d3d12_resource_incref(resource);
+}
+
+static void d3d12_resource_deferred_decref(void *userdata)
+{
+    struct d3d12_resource *resource = userdata;
+    d3d12_resource_decref(resource);
+}
+
+static void d3d12_device_add_pending_resource_decref(struct d3d12_device *device,
+        struct d3d12_resource *resource)
+{
+    /* Just keep sparse resources alive indefinitely until the free pool is exhausted.
+     * They only consume VA space, not VRAM, so this is a somewhat reasonable workaround for
+     * certain games that just refuse to be well-behaved.
+     * Ordering is irrelevant so just use an atomic counter and atomic exchanges. */
+    uint32_t index = vkd3d_atomic_uint32_increment(
+            &device->memory_allocator.sparse_pending_destroy_count, vkd3d_memory_order_relaxed);
+    index &= ARRAY_SIZE(device->memory_allocator.sparse_pending_destroy) - 1;
+
+    resource = vkd3d_atomic_ptr_exchange_explicit(&device->memory_allocator.sparse_pending_destroy[index],
+            resource, vkd3d_memory_order_acq_rel);
+
+    if (resource)
+        d3d12_resource_decref(resource);
+}
+
 static ULONG STDMETHODCALLTYPE d3d12_resource_Release(d3d12_resource_iface *iface)
 {
     struct d3d12_resource *resource = impl_from_ID3D12Resource2(iface);
@@ -2021,7 +2051,30 @@ static ULONG STDMETHODCALLTYPE d3d12_resource_Release(d3d12_resource_iface *ifac
     {
         d3d_destruction_notifier_notify(&resource->destruction_notifier);
 
-        d3d12_resource_decref(resource);
+        if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_DEFER_RESOURCE_DESTRUCTION)
+        {
+            /* AC: Valhalla seems to trigger use-after-free long
+             * after the resource is destroyed in some cases.
+             * Fortunately, this resource always seems to be a sparse resource,
+             * so it's possible Windows native behavior is to hold on to sparse VA space
+             * longer than we get on Linux for whatever reason, so "indefinitely" post-pone
+             * the release of these resources. The worst cost of this is a little VA space bloat. */
+            bool postpone_decref = !!(resource->flags & VKD3D_RESOURCE_RESERVED);
+
+            d3d12_device_add_queue_timeline_deferred_decref(
+                    device,
+                    d3d12_resource_deferred_incref,
+                    d3d12_resource_deferred_decref,
+                    resource, postpone_decref);
+
+            if (postpone_decref)
+                d3d12_device_add_pending_resource_decref(device, resource);
+        }
+        else
+        {
+            d3d12_resource_decref(resource);
+        }
+
         d3d12_device_release(device);
     }
 
@@ -9172,6 +9225,25 @@ void vkd3d_memory_info_cleanup(struct vkd3d_memory_info *info,
     pthread_mutex_destroy(&info->budget_lock);
 }
 
+static uint32_t vkd3d_memory_info_filter_sysmem_memory_types(struct d3d12_device *device,
+        const struct vkd3d_memory_info *info, uint32_t type_mask)
+{
+    uint32_t result_mask = 0;
+    uint32_t heap_index;
+
+    while (type_mask)
+    {
+        unsigned int type_index = vkd3d_bitmask_iter32(&type_mask);
+        heap_index = device->memory_properties.memoryTypes[type_index].heapIndex;
+
+        /* Do not allow anything device local here. If we're doing fallbacks we can only consider non-device local. */
+        if (!(device->memory_properties.memoryHeaps[heap_index].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT))
+            result_mask |= 1u << type_index;
+    }
+
+    return result_mask;
+}
+
 HRESULT vkd3d_memory_info_init(struct vkd3d_memory_info *info,
         struct d3d12_device *device)
 {
@@ -9299,6 +9371,25 @@ HRESULT vkd3d_memory_info_init(struct vkd3d_memory_info *info,
     for (i = 0; i < device->memory_properties.memoryTypeCount; i++)
         if (device->memory_properties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
             host_visible_mask |= 1u << i;
+
+    if ((device->device_info.properties2.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ||
+            device->device_info.properties2.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU) &&
+            topology.exists_device_only_type && topology.exists_host_only_type &&
+            topology.largest_device_local_heap_index != topology.largest_host_only_heap_index)
+    {
+        /* There is a clear distinction between sysmem and VRAM.
+         * If we're forced to fallback allocate, compute which memory types we can use. */
+        info->fallback_domain.rt_ds_type_mask = vkd3d_memory_info_filter_sysmem_memory_types(
+                device, info, rt_ds_type_mask);
+        info->fallback_domain.sampled_type_mask = vkd3d_memory_info_filter_sysmem_memory_types(
+                device, info, sampled_type_mask);
+        info->fallback_domain.buffer_type_mask = vkd3d_memory_info_filter_sysmem_memory_types(
+                device, info, buffer_type_mask);
+    }
+    else
+    {
+        info->fallback_domain = info->non_cpu_accessible_domain;
+    }
 
     /* We don't create images in host-visible memory anymore, only buffers */
     info->cpu_accessible_domain.buffer_type_mask = buffer_type_mask & host_visible_mask;

@@ -20,14 +20,12 @@
 
 #include "vkd3d_shader_private.h"
 #include "vkd3d_string.h"
+#include "vkd3d_threads.h"
 
 #include "vkd3d_platform.h"
-#include "vkd3d_threads.h"
 
 #include <stdio.h>
 #include <inttypes.h>
-
-#include "vkd3d_dxcapi.h"
 
 static void vkd3d_shader_dump_blob(const char *path, vkd3d_shader_hash_t hash, const void *data, size_t size, const char *ext)
 {
@@ -365,37 +363,6 @@ static int vkd3d_shader_validate_shader_type(enum vkd3d_shader_type type, VkShad
     return 0;
 }
 
-#ifdef VKD3D_ENABLE_DXILCONV
-static DxcCreateInstanceProc vkd3d_dxilconv_instance_proc;
-
-static void dxilconv_init_once(void)
-{
-    vkd3d_module_t module = vkd3d_dlopen("dxilconv.dll");
-    if (module)
-        vkd3d_dxilconv_instance_proc = vkd3d_dlsym(module, "DxcCreateInstance");
-
-    if (vkd3d_dxilconv_instance_proc)
-        INFO("Found dxilconv.dll. Will use that for DXBC.\n");
-    else
-        INFO("Did not find dxilconv.dll. Using built-in DXBC implementation.\n");
-}
-
-static IDxbcConverter *vkd3d_shader_compiler_create_dxbc_converter(void)
-{
-    static pthread_once_t once_key = PTHREAD_ONCE_INIT;
-    IDxbcConverter *iface;
-
-    pthread_once(&once_key, dxilconv_init_once);
-    if (!vkd3d_dxilconv_instance_proc)
-        return NULL;
-
-    if (FAILED(vkd3d_dxilconv_instance_proc(&CLSID_DxbcConverter, &IID_IDxbcConverter, (void **)&iface)))
-        return NULL;
-
-    return iface;
-}
-#endif
-
 int vkd3d_shader_compile_dxbc(const struct vkd3d_shader_code *dxbc,
         struct vkd3d_shader_code *spirv,
         struct vkd3d_shader_code_debug *spirv_debug,
@@ -408,6 +375,7 @@ int vkd3d_shader_compile_dxbc(const struct vkd3d_shader_code *dxbc,
     struct vkd3d_shader_scan_info scan_info;
     struct vkd3d_shader_parser parser;
     vkd3d_shader_hash_t hash;
+    uint32_t quirks;
     bool is_dxil;
     int ret;
 
@@ -419,43 +387,18 @@ int vkd3d_shader_compile_dxbc(const struct vkd3d_shader_code *dxbc,
 
     is_dxil = shader_is_dxil(dxbc->code, dxbc->size);
 
-#ifdef VKD3D_ENABLE_DXILCONV
-    if (!is_dxil)
-    {
-        IDxbcConverter *conv = vkd3d_shader_compiler_create_dxbc_converter();
-        if (conv)
-        {
-            struct vkd3d_shader_code converted;
-            UINT32 dxil_size;
-            int ret = -1;
-            void *dxil;
-
-            if (SUCCEEDED(IDxbcConverter_Convert(conv, dxbc->code, dxbc->size, NULL, &dxil, &dxil_size, NULL)))
-            {
-                converted.code = dxil;
-                converted.size = dxil_size;
-                spirv->meta.hash = vkd3d_shader_hash(dxbc);
-                ret = vkd3d_shader_compile_dxil(&converted, spirv, spirv_debug, shader_interface_info, compile_args);
-                CoTaskMemFree(dxil);
-            }
-            IDxbcConverter_Release(conv);
-
-            if (ret == 0)
-                return ret;
-        }
-    }
-#endif
-
     /* DXIL is handled externally through dxil-spirv. */
-    if (is_dxil)
+    hash = vkd3d_shader_hash(dxbc);
+    quirks = vkd3d_shader_compile_arguments_select_quirks(compile_args, hash);
+
+    if (is_dxil || (quirks & VKD3D_SHADER_QUIRK_DXBC_SPIRV))
     {
         spirv->meta.hash = 0;
-        return vkd3d_shader_compile_dxil(dxbc, spirv, spirv_debug, shader_interface_info, compile_args);
+        return vkd3d_shader_compile_dxil(dxbc, spirv, spirv_debug, shader_interface_info, compile_args, is_dxil);
     }
 
     memset(&spirv->meta, 0, sizeof(spirv->meta));
 
-    hash = vkd3d_shader_hash(dxbc);
     spirv->meta.hash = hash;
     if (vkd3d_shader_replace(hash, &spirv->code, &spirv->size))
     {
@@ -915,33 +858,155 @@ vkd3d_shader_hash_t vkd3d_shader_hash(const struct vkd3d_shader_code *shader)
     return h;
 }
 
+struct vkd3d_shader_quirk_entry
+{
+    vkd3d_shader_hash_t lo;
+    vkd3d_shader_hash_t hi;
+    uint32_t flags;
+};
+
+static struct vkd3d_shader_quirk_entry *vkd3d_shader_quirk_entries;
+size_t vkd3d_shader_quirk_entry_count;
+
+#define ENTRY(x) { #x, VKD3D_SHADER_QUIRK_ ## x }
+static const struct vkd3d_shader_quirk_mapping
+{
+    const char *name;
+    enum vkd3d_shader_quirk quirk;
+} vkd3d_shader_quirk_mappings[] = {
+    ENTRY(FORCE_EXPLICIT_LOD_IN_CONTROL_FLOW),
+    ENTRY(FORCE_TGSM_BARRIERS),
+    ENTRY(INVARIANT_POSITION),
+    ENTRY(FORCE_NOCONTRACT_MATH),
+    ENTRY(LIMIT_TESS_FACTORS_32),
+    ENTRY(LIMIT_TESS_FACTORS_16),
+    ENTRY(LIMIT_TESS_FACTORS_8),
+    ENTRY(LIMIT_TESS_FACTORS_4),
+    ENTRY(FORCE_SUBGROUP_SIZE_1),
+    ENTRY(FORCE_MAX_WAVE32),
+    ENTRY(FORCE_MIN16_AS_32BIT),
+    ENTRY(REWRITE_GRAD_TO_BIAS),
+    ENTRY(FORCE_LOOP),
+    ENTRY(DESCRIPTOR_HEAP_ROBUSTNESS),
+    ENTRY(DISABLE_OPTIMIZATIONS),
+    ENTRY(FORCE_NOCONTRACT_MATH_VS),
+    ENTRY(FORCE_DEVICE_MEMORY_BARRIER_THREAD_GROUP_COHERENCY),
+    ENTRY(ASSUME_BROKEN_SUB_8x8_CUBE_MIPS),
+    ENTRY(FORCE_ROBUST_PHYSICAL_CBV_LOAD_FORWARDING),
+    ENTRY(AGGRESSIVE_NONUNIFORM),
+    ENTRY(HOIST_DERIVATIVES),
+    ENTRY(DXBC_SPIRV),
+    ENTRY(FORCE_MIN_WAVE32),
+    ENTRY(PROMOTE_GROUP_TO_DEVICE_MEMORY_BARRIER),
+};
+#undef ENTRY
+
+static void vkd3d_shader_init_quirk_table(void)
+{
+    struct vkd3d_shader_quirk_entry entry;
+    size_t size = 0;
+    char env[128];
+    char *trail;
+    FILE *file;
+    size_t i;
+
+    if (!vkd3d_get_env_var("VKD3D_SHADER_QUIRKS", env, sizeof(env)))
+        return;
+
+    file = fopen(env, "r");
+    if (!file)
+    {
+        INFO("Failed to open VKD3D_SHADER_QUIRKS file \"%s\".\n", env);
+        return;
+    }
+
+    while (fgets(env, sizeof(env), file))
+    {
+        if (!vkd3d_shader_hash_range_parse_line(env, &entry.lo, &entry.hi, &trail))
+            continue;
+
+        if (*trail == '\0')
+            continue;
+
+        for (i = 0; i < ARRAY_SIZE(vkd3d_shader_quirk_mappings); i++)
+        {
+            if (strcmp(trail, vkd3d_shader_quirk_mappings[i].name) == 0)
+            {
+                entry.flags = vkd3d_shader_quirk_mappings[i].quirk;
+                INFO("Parsed shader quirk entry: [%016"PRIx64", %016"PRIx64"] -> %s\n",
+                        entry.lo, entry.hi, trail);
+                break;
+            }
+        }
+
+        if (i == ARRAY_SIZE(vkd3d_shader_quirk_mappings))
+        {
+            INFO("Parsed shader quirk entry: [%016"PRIx64", %016"PRIx64"], but no quirk for %s was found.\n",
+                    entry.lo, entry.hi, trail);
+        }
+
+        vkd3d_array_reserve((void **)&vkd3d_shader_quirk_entries, &size,
+                vkd3d_shader_quirk_entry_count + 1, sizeof(*vkd3d_shader_quirk_entries));
+        vkd3d_shader_quirk_entries[vkd3d_shader_quirk_entry_count++] = entry;
+    }
+
+    fclose(file);
+}
+
+static pthread_once_t vkd3d_shader_quirk_once = PTHREAD_ONCE_INIT;
+
 uint32_t vkd3d_shader_compile_arguments_select_quirks(
         const struct vkd3d_shader_compile_arguments *compile_args, vkd3d_shader_hash_t shader_hash)
 {
+    uint32_t quirks = 0;
     unsigned int i;
+
+    pthread_once(&vkd3d_shader_quirk_once, vkd3d_shader_init_quirk_table);
+
+    for (i = 0; i < vkd3d_shader_quirk_entry_count; i++)
+    {
+        if (vkd3d_shader_quirk_entries[i].lo <= shader_hash && vkd3d_shader_quirk_entries[i].hi >= shader_hash)
+        {
+            quirks |= vkd3d_shader_quirk_entries[i].flags;
+            INFO("Adding shader quirks #%x for hash %016"PRIx64".\n",
+                    vkd3d_shader_quirk_entries[i].flags, shader_hash);
+        }
+    }
+
     if (compile_args && compile_args->quirks)
     {
         for (i = 0; i < compile_args->quirks->num_hashes; i++)
             if (compile_args->quirks->hashes[i].shader_hash == shader_hash)
-                return compile_args->quirks->hashes[i].quirks | compile_args->quirks->global_quirks;
-        return compile_args->quirks->default_quirks | compile_args->quirks->global_quirks;
+                return quirks | compile_args->quirks->hashes[i].quirks | compile_args->quirks->global_quirks;
+        return quirks | compile_args->quirks->default_quirks | compile_args->quirks->global_quirks;
     }
     else
-        return 0;
+        return quirks;
 }
 
 uint64_t vkd3d_shader_get_revision(void)
 {
+    uint64_t quirk_hash = 0;
+    size_t i;
+
+    pthread_once(&vkd3d_shader_quirk_once, vkd3d_shader_init_quirk_table);
+
+    if (vkd3d_shader_quirk_entry_count)
+    {
+        quirk_hash = hash_fnv1_init();
+        for (i = 0; i < vkd3d_shader_quirk_entry_count; i++)
+        {
+            quirk_hash = hash_fnv1_iterate_u64(quirk_hash, vkd3d_shader_quirk_entries[i].lo);
+            quirk_hash = hash_fnv1_iterate_u64(quirk_hash, vkd3d_shader_quirk_entries[i].hi);
+            quirk_hash = hash_fnv1_iterate_u32(quirk_hash, vkd3d_shader_quirk_entries[i].flags);
+        }
+    }
+
     /* This is meant to be bumped every time a change is made to the shader compiler.
      * Might get nuked later ...
      * It's not immediately useful for invalidating pipeline caches, since that would mostly be covered
      * by vkd3d-proton Git hash. */
-#ifdef VKD3D_ENABLE_DXILCONV
-    dxilconv_init_once();
-    return vkd3d_dxilconv_instance_proc ? 2 : 1;
-#else
-    return 1;
-#endif
+    return quirk_hash ^ 1;
 }
 
 struct vkd3d_shader_stage_io_entry *vkd3d_shader_stage_io_map_append(struct vkd3d_shader_stage_io_map *map,
@@ -1097,4 +1162,51 @@ vkd3d_shader_hash_t vkd3d_root_signature_v_1_2_compute_layout_compat_hash(
     }
 
     return hash;
+}
+
+bool vkd3d_shader_hash_range_parse_line(char *line,
+        vkd3d_shader_hash_t *lo, vkd3d_shader_hash_t *hi,
+        char **trail)
+{
+    vkd3d_shader_hash_t lo_hash;
+    vkd3d_shader_hash_t hi_hash;
+    char *old_end_ptr;
+    char *end_ptr;
+
+    /* Look for either a single number, or lohash-hihash format. */
+    if (!isalnum(*line))
+        return false;
+    lo_hash = strtoull(line, &end_ptr, 16);
+
+    while (*end_ptr != '\0' && !isalnum(*end_ptr))
+        end_ptr++;
+
+    old_end_ptr = end_ptr;
+    hi_hash = strtoull(end_ptr, &end_ptr, 16);
+
+    /* If we didn't fully consume a hex number here, back up. */
+    if (*end_ptr != '\0' && *end_ptr != '\n' && *end_ptr != ' ')
+    {
+        end_ptr = old_end_ptr;
+        hi_hash = 0;
+    }
+
+    while (*end_ptr != '\0' && !isalpha(*end_ptr))
+        end_ptr++;
+
+    if (!hi_hash)
+        hi_hash = lo_hash;
+
+    *lo = lo_hash;
+    *hi = hi_hash;
+    *trail = end_ptr;
+
+    if (*end_ptr != '\0')
+    {
+        char *stray_newline = end_ptr + (strlen(end_ptr) - 1);
+        if (*stray_newline == '\n')
+            *stray_newline = '\0';
+    }
+
+    return true;
 }
