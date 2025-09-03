@@ -520,7 +520,8 @@ enum vkd3d_application_feature_override
     VKD3D_APPLICATION_FEATURE_NO_DEFAULT_DXR_ON_DECK,
     VKD3D_APPLICATION_FEATURE_LIMIT_DXR_1_0,
     VKD3D_APPLICATION_FEATURE_DISABLE_NV_REFLEX,
-    VKD3D_APPLICATION_FEATURE_MESH_SHADER_WITHOUT_BARYCENTRICS
+    VKD3D_APPLICATION_FEATURE_MESH_SHADER_WITHOUT_BARYCENTRICS,
+    VKD3D_APPLICATION_FEATURE_DISABLE_ANTI_LAG,
 };
 
 static enum vkd3d_application_feature_override vkd3d_application_feature_override;
@@ -569,8 +570,9 @@ static const struct vkd3d_instance_application_meta application_override[] = {
     /* Serious Sam 4 (257420).
      * Invariant workarounds cause graphical glitches when rendering foliage on NV. */
     { VKD3D_STRING_COMPARE_EXACT, "Sam4.exe", VKD3D_CONFIG_FLAG_FORCE_NO_INVARIANT_POSITION | VKD3D_CONFIG_FLAG_SMALL_VRAM_REBAR, 0 },
-    /* Cyberpunk 2077 (1091500). */
-    { VKD3D_STRING_COMPARE_EXACT, "Cyberpunk2077.exe", VKD3D_CONFIG_FLAG_ALLOW_SBT_COLLECTION, 0 },
+    /* Cyberpunk 2077 (1091500). For whatever reason, anti-lag is always used if it is supported (impossible to disable),
+     * leading to bad performance in some cases. Currently only affects Proton-GE which ships amdxc64.dll shim by default. */
+    { VKD3D_STRING_COMPARE_EXACT, "Cyberpunk2077.exe", VKD3D_CONFIG_FLAG_ALLOW_SBT_COLLECTION, 0, VKD3D_APPLICATION_FEATURE_DISABLE_ANTI_LAG },
     /* Control (870780). Control fails to detect DXR if 1.1 is exposed. */
     { VKD3D_STRING_COMPARE_EXACT, "Control_DX12.exe", 0, 0, VKD3D_APPLICATION_FEATURE_LIMIT_DXR_1_0 },
     /* Hellblade: Senua's Sacrifice (414340). Enables RT by default if supported which is ... jarring and particularly jarring on Deck. */
@@ -839,6 +841,15 @@ static const struct vkd3d_shader_quirk_info deadspace_quirks = {
     deadspace_hashes, ARRAY_SIZE(deadspace_hashes), 0,
 };
 
+static const struct vkd3d_shader_quirk_hash death_stranding_hashes[] = {
+    /* Game forgets to transition RENDER_TARGET to PIXEL_SHADER_RESOURCE. */
+    { 0x014fa51aaa3f3139, VKD3D_SHADER_QUIRK_FORCE_GRAPHICS_BARRIER_BEFORE_RENDER_PASS },
+};
+
+static const struct vkd3d_shader_quirk_info death_stranding_quirks = {
+    death_stranding_hashes, ARRAY_SIZE(death_stranding_hashes), 0,
+};
+
 static const struct vkd3d_shader_quirk_meta application_shader_quirks[] = {
     /* F1 2020 (1080110) */
     { VKD3D_STRING_COMPARE_EXACT, "F1_2020_dx12.exe", &f1_2019_2020_quirks },
@@ -897,6 +908,9 @@ static const struct vkd3d_shader_quirk_meta application_shader_quirks[] = {
     { VKD3D_STRING_COMPARE_ENDS_WITH, "-Shipping.exe", &ue4_quirks },
     /* Dead Space (2023) */
     { VKD3D_STRING_COMPARE_ENDS_WITH, "Dead Space.exe", &deadspace_quirks },
+    /* Death Stranding  */
+    { VKD3D_STRING_COMPARE_EXACT, "ds.exe", &death_stranding_quirks },
+    { VKD3D_STRING_COMPARE_EXACT, "DeathStranding.exe", &death_stranding_quirks },
     /* MSVC fails to compile empty array. */
     { VKD3D_STRING_COMPARE_NEVER, NULL, NULL },
 };
@@ -9262,7 +9276,14 @@ static void d3d12_device_caps_override_application(struct d3d12_device *device)
             break;
 
         case VKD3D_APPLICATION_FEATURE_DISABLE_NV_REFLEX:
+            INFO("Disabling NV reflex.\n");
             device->vk_info.NV_low_latency2 = false;
+            break;
+
+        case VKD3D_APPLICATION_FEATURE_DISABLE_ANTI_LAG:
+            INFO("Disabling AMD anti-lag.\n");
+            device->vk_info.AMD_anti_lag = false;
+            device->device_info.anti_lag_amd.antiLag = VK_FALSE;
             break;
 
         default:
