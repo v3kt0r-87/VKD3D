@@ -21,6 +21,7 @@
 #include "vkd3d_private.h"
 #include "vkd3d_sonames.h"
 #include "vkd3d_descriptor_debug.h"
+#include "vkd3d_timestamp_profiler.h"
 #include "vkd3d_platform.h"
 
 #ifdef VKD3D_ENABLE_RENDERDOC
@@ -650,10 +651,9 @@ static const struct vkd3d_instance_application_meta application_override[] = {
     { VKD3D_STRING_COMPARE_EXACT, "DeathStranding.exe", VKD3D_CONFIG_FLAG_NO_UPLOAD_HVV, 0 },
     /* AC: Valhalla (2208920). Very ugly use-after-free in some cases. The main culprit seems a sparse resource. */
     { VKD3D_STRING_COMPARE_EXACT, "ACValhalla.exe", VKD3D_CONFIG_FLAG_DEFER_RESOURCE_DESTRUCTION, 0 },
-    /* Endless Legend 2 (3407390) and its demo (3596660). Broken tessellation shaders with legacy compiler. */
-    { VKD3D_STRING_COMPARE_EXACT, "Endless Legend 2.exe", VKD3D_CONFIG_FLAG_ENABLE_DXBC_SPIRV, 0 },
-    /* Red Dead Redemption 2 (1174180). Broken shader compilation with legacy compiler. */
-    { VKD3D_STRING_COMPARE_EXACT, "RDR2.exe", VKD3D_CONFIG_FLAG_ENABLE_DXBC_SPIRV, 0 },
+    /* Broken UAV clear without sync before RT. There's also a missing clear UAV barrier before render pass ROV.
+     * Extremely rare case ... */
+    { VKD3D_STRING_COMPARE_EXACT, "3DMarkPortRoyal.exe", VKD3D_CONFIG_FLAG_CLEAR_UAV_SYNC, 0 },
     { VKD3D_STRING_COMPARE_NEVER, NULL, 0, 0 }
 };
 
@@ -850,6 +850,15 @@ static const struct vkd3d_shader_quirk_info death_stranding_quirks = {
     death_stranding_hashes, ARRAY_SIZE(death_stranding_hashes), 0,
 };
 
+static const struct vkd3d_shader_quirk_hash wuthering_waves_hashes[] = {
+    /* LightGridInjectionCS. Forgets to UAV barrier after ClearCS. */
+    { 0x6c82985f4152e2de, VKD3D_SHADER_QUIRK_FORCE_PRE_COMPUTE_BARRIER },
+};
+
+static const struct vkd3d_shader_quirk_info wuthering_waves_quirks = {
+    wuthering_waves_hashes, ARRAY_SIZE(wuthering_waves_hashes), 0,
+};
+
 static const struct vkd3d_shader_quirk_meta application_shader_quirks[] = {
     /* F1 2020 (1080110) */
     { VKD3D_STRING_COMPARE_EXACT, "F1_2020_dx12.exe", &f1_2019_2020_quirks },
@@ -904,13 +913,16 @@ static const struct vkd3d_shader_quirk_meta application_shader_quirks[] = {
     /* Satisfactory (526870). */
     { VKD3D_STRING_COMPARE_EXACT, "FactoryGameSteam-Win64-Shipping.exe", &satisfactory_quirks },
     { VKD3D_STRING_COMPARE_EXACT, "FactoryGameEGS-Win64-Shipping.exe", &satisfactory_quirks },
-    /* Unreal Engine 4 */
-    { VKD3D_STRING_COMPARE_ENDS_WITH, "-Shipping.exe", &ue4_quirks },
+    /* Wuthering Waves */
+    { VKD3D_STRING_COMPARE_EXACT, "Client-Win64-Shipping.exe", &wuthering_waves_quirks },
     /* Dead Space (2023) */
     { VKD3D_STRING_COMPARE_ENDS_WITH, "Dead Space.exe", &deadspace_quirks },
     /* Death Stranding  */
     { VKD3D_STRING_COMPARE_EXACT, "ds.exe", &death_stranding_quirks },
     { VKD3D_STRING_COMPARE_EXACT, "DeathStranding.exe", &death_stranding_quirks },
+    { VKD3D_STRING_COMPARE_EXACT, "3DMarkPortRoyal.exe", &heap_robustness_quirks },
+    /* Unreal Engine 4 */
+    { VKD3D_STRING_COMPARE_ENDS_WITH, "-Shipping.exe", &ue4_quirks },
     /* MSVC fails to compile empty array. */
     { VKD3D_STRING_COMPARE_NEVER, NULL, NULL },
 };
@@ -993,6 +1005,7 @@ static void vkd3d_instance_deduce_config_flags_from_environment(void)
                 VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_NO_SERIALIZE_SPIRV |
                 VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_IGNORE_SPIRV;
         vkd3d_config_flags |= VKD3D_CONFIG_FLAG_DEBUG_UTILS;
+        vkd3d_config_flags |= VKD3D_CONFIG_FLAG_EXTENDED_DEBUG_UTILS;
     }
 
     /* RADV_THREAD_TRACE_xxx are deprecated and will be removed at some point. */
@@ -1026,7 +1039,7 @@ static void vkd3d_instance_apply_global_shader_quirks(void)
     static const struct override overrides[] =
     {
         { VKD3D_CONFIG_FLAG_FORCE_NO_INVARIANT_POSITION, VKD3D_SHADER_QUIRK_INVARIANT_POSITION, true },
-        { VKD3D_CONFIG_FLAG_ENABLE_DXBC_SPIRV, VKD3D_SHADER_QUIRK_DXBC_SPIRV, false },
+        { VKD3D_CONFIG_FLAG_DISABLE_DXBC_SPIRV, VKD3D_SHADER_QUIRK_DXBC_SPIRV, true },
     };
     uint64_t eq_test;
     unsigned int i;
@@ -1132,7 +1145,7 @@ static const struct vkd3d_debug_option vkd3d_config_options[] =
     {"queue_profile_extra", VKD3D_CONFIG_FLAG_QUEUE_PROFILE_EXTRA},
     {"damage_not_zeroed_allocations", VKD3D_CONFIG_FLAG_DAMAGE_NOT_ZEROED_ALLOCATIONS},
     {"defer_resource_destruction", VKD3D_CONFIG_FLAG_DEFER_RESOURCE_DESTRUCTION},
-    {"dxbc_spirv", VKD3D_CONFIG_FLAG_ENABLE_DXBC_SPIRV},
+    {"disable_dxbc_spirv", VKD3D_CONFIG_FLAG_DISABLE_DXBC_SPIRV},
 };
 
 static void vkd3d_config_flags_init_once(void)
@@ -1141,12 +1154,6 @@ static void vkd3d_config_flags_init_once(void)
 
     vkd3d_get_env_var("VKD3D_CONFIG", config, sizeof(config));
     vkd3d_config_flags = vkd3d_parse_debug_options(config, vkd3d_config_options, ARRAY_SIZE(vkd3d_config_options));
-
-    if (vkd3d_debug_control_is_test_suite())
-    {
-        INFO("Running test suite, enabling dxbc-spirv.\n");
-        vkd3d_config_flags |= VKD3D_CONFIG_FLAG_ENABLE_DXBC_SPIRV;
-    }
 
     if (!(vkd3d_config_flags & VKD3D_CONFIG_FLAG_SKIP_APPLICATION_WORKAROUNDS))
         vkd3d_instance_apply_application_workarounds();
@@ -4222,6 +4229,9 @@ static void d3d12_device_destroy(struct d3d12_device *device)
     vkd3d_address_binding_tracker_cleanup(&device->address_binding_tracker, device);
     vkd3d_queue_timeline_trace_cleanup(&device->queue_timeline_trace);
     vkd3d_shader_debug_ring_cleanup(&device->debug_ring, device);
+#ifdef VKD3D_ENABLE_PROFILING
+    vkd3d_timestamp_profiler_deinit(device->timestamp_profiler);
+#endif
 #ifdef VKD3D_ENABLE_BREADCRUMBS
     vkd3d_breadcrumb_tracer_cleanup_barrier_hashes(&device->breadcrumb_tracer);
     if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_BREADCRUMBS)
@@ -9544,6 +9554,12 @@ static void vkd3d_init_shader_extensions(struct d3d12_device *device)
         device->vk_info.shader_extensions[device->vk_info.shader_extension_count++] =
                 VKD3D_SHADER_TARGET_EXTENSION_NV_COOPMAT2_CONVERSIONS;
     }
+
+    if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_EXTENDED_DEBUG_UTILS)
+    {
+        device->vk_info.shader_extensions[device->vk_info.shader_extension_count++] =
+                VKD3D_SHADER_TARGET_EXTENSION_EXTENDED_NON_SEMANTIC;
+    }
 }
 
 static void vkd3d_compute_shader_interface_key(struct d3d12_device *device)
@@ -9860,6 +9876,10 @@ static HRESULT d3d12_device_init(struct d3d12_device *device,
                 VKD3D_DESCRIPTOR_DEBUG_DEFAULT_NUM_COOKIES, device)))
             goto out_cleanup_breadcrumb_tracer;
     }
+
+#ifdef VKD3D_ENABLE_PROFILING
+    device->timestamp_profiler = vkd3d_timestamp_profiler_init(device);
+#endif
 
     hash_map_init(&device->vertex_input_pipelines,
             vkd3d_vertex_input_pipeline_desc_hash,

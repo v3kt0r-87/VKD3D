@@ -769,6 +769,12 @@ float vkd3d_convert_to_vk_prio(D3D12_RESIDENCY_PRIORITY d3d12prio);
 
 struct vkd3d_view_map;
 
+struct vkd3d_cookie
+{
+    uint32_t index;
+    uint32_t va_map_timestamp;
+};
+
 struct vkd3d_unique_resource
 {
     union
@@ -776,7 +782,7 @@ struct vkd3d_unique_resource
         VkBuffer vk_buffer;
         VkImage vk_image;
     };
-    uint64_t cookie;
+    struct vkd3d_cookie cookie;
     VkDeviceAddress va;
     VkDeviceSize size;
 
@@ -989,7 +995,8 @@ enum vkd3d_resource_flag
     VKD3D_RESOURCE_EXTERNAL               = (1u << 5),
     VKD3D_RESOURCE_ACCELERATION_STRUCTURE = (1u << 6),
     VKD3D_RESOURCE_GENERAL_LAYOUT         = (1u << 7),
-    VKD3D_RESOURCE_ZERO_INITIALIZED       = (1u << 8)
+    VKD3D_RESOURCE_ZERO_INITIALIZED       = (1u << 8),
+    VKD3D_RESOURCE_RETAINED_GPU_REFERENCE = (1u << 9)
 };
 
 #define VKD3D_INVALID_TILE_INDEX (~0u)
@@ -1036,7 +1043,7 @@ struct vkd3d_view_map
     spinlock_t spinlock;
     struct hash_map map;
 #ifdef VKD3D_ENABLE_DESCRIPTOR_QA
-    uint64_t resource_cookie;
+    struct vkd3d_cookie resource_cookie;
 #endif
 };
 
@@ -1066,6 +1073,7 @@ struct d3d12_resource
     d3d12_resource_iface ID3D12Resource_iface;
     LONG refcount;
     LONG internal_refcount;
+    LONG weak_count;
 
     D3D12_RESOURCE_DESC1 desc;
     D3D12_HEAP_PROPERTIES heap_properties;
@@ -1082,6 +1090,7 @@ struct d3d12_resource
     VkImageLayout common_layout;
     D3D12_RESOURCE_STATES initial_state;
     uint32_t initial_layout_transition;
+
 #ifdef VKD3D_ENABLE_BREADCRUMBS
     bool initial_layout_transition_validate_only;
 #endif
@@ -1126,8 +1135,19 @@ static inline VkImageLayout d3d12_resource_pick_layout(const struct d3d12_resour
 
 ULONG d3d12_resource_incref(struct d3d12_resource *resource);
 ULONG d3d12_resource_decref(struct d3d12_resource *resource);
+/* Only called by fence worker. Adds detection for use-after-free in debug builds. */
+void d3d12_resource_decref_retained(struct d3d12_resource *resource);
+void d3d12_resource_incref_weak(struct d3d12_resource *resource);
+void d3d12_resource_decref_weak(struct d3d12_resource *resource);
 
-LONG64 vkd3d_allocate_cookie();
+struct vkd3d_cookie vkd3d_allocate_cookie(void);
+UINT vkd3d_allocate_cookie_va_timestamp(void);
+
+static inline struct vkd3d_cookie vkd3d_null_cookie(void)
+{
+    struct vkd3d_cookie cookie = { 0 };
+    return cookie;
+}
 
 bool d3d12_resource_is_cpu_accessible(const struct d3d12_resource *resource);
 void d3d12_resource_promote_desc(const D3D12_RESOURCE_DESC *desc, D3D12_RESOURCE_DESC1 *desc1);
@@ -1211,7 +1231,7 @@ struct vkd3d_view
 {
     LONG refcount;
     enum vkd3d_view_type type;
-    uint64_t cookie;
+    struct vkd3d_cookie cookie;
 
     union
     {
@@ -1342,7 +1362,7 @@ struct vkd3d_descriptor_metadata_image_view
 struct vkd3d_descriptor_metadata_view
 {
 #ifdef VKD3D_ENABLE_DESCRIPTOR_QA
-    uint64_t qa_cookie;
+    struct vkd3d_cookie qa_cookie;
 #endif
     union
     {
@@ -1355,7 +1375,7 @@ struct vkd3d_descriptor_metadata_view
 #ifdef VKD3D_ENABLE_DESCRIPTOR_QA
 STATIC_ASSERT(sizeof(struct vkd3d_descriptor_metadata_view) == 24);
 static inline void vkd3d_descriptor_metadata_view_set_qa_cookie(
-        struct vkd3d_descriptor_metadata_view *view, uint64_t cookie)
+        struct vkd3d_descriptor_metadata_view *view, struct vkd3d_cookie cookie)
 {
     view->qa_cookie = cookie;
 }
@@ -1525,7 +1545,7 @@ struct d3d12_descriptor_heap
     struct vkd3d_host_visible_buffer_range buffer_ranges;
 #ifdef VKD3D_ENABLE_DESCRIPTOR_QA
     struct vkd3d_host_visible_buffer_range descriptor_heap_info;
-    uint64_t cookie;
+    struct vkd3d_cookie cookie;
 #endif
 
     struct d3d12_null_descriptor_template null_descriptor_template;
@@ -1704,7 +1724,7 @@ struct d3d12_query_heap
     struct vkd3d_device_memory_allocation device_allocation;
     VkBuffer vk_buffer;
     VkDeviceAddress va;
-    uint64_t cookie;
+    struct vkd3d_cookie cookie;
     uint32_t initialized;
 
     struct d3d12_device *device;
@@ -1843,6 +1863,12 @@ struct d3d12_root_signature
 
     unsigned int root_constant_count;
     struct vkd3d_shader_push_constant_buffer *root_constants;
+
+    unsigned int root_parameter_mappings_count;
+    struct vkd3d_shader_root_parameter_mapping *root_parameter_mappings;
+
+    void *root_signature_blob;
+    size_t root_signature_blob_size;
 
     struct vkd3d_shader_descriptor_binding push_constant_ubo_binding;
     struct vkd3d_shader_descriptor_binding raw_va_aux_buffer_binding;
@@ -2196,6 +2222,13 @@ struct d3d12_pipeline_state
 
     struct vkd3d_private_store private_store;
     struct d3d_destruction_notifier destruction_notifier;
+
+#ifdef VKD3D_ENABLE_PROFILING
+    struct
+    {
+        size_t pso_entry_index;
+    } timestamp_profiler;
+#endif
 };
 
 HRESULT d3d12_pipeline_state_create_shader_module(struct d3d12_device *device,
@@ -2946,6 +2979,8 @@ struct d3d12_command_list_sequence
     struct d3d12_command_list_iteration_indirect_meta *indirect_meta;
 };
 
+struct vkd3d_timestamp_profiler_submitted_work;
+
 struct d3d12_command_list
 {
     d3d12_command_list_iface ID3D12GraphicsCommandList_iface;
@@ -3066,6 +3101,10 @@ struct d3d12_command_list
     size_t query_resolve_count;
     size_t query_resolve_size;
 
+    struct d3d12_resource **retained_resources;
+    size_t retained_resources_size;
+    size_t retained_resources_count;
+
     struct hash_map query_resolve_lut;
 
     struct d3d12_buffer_copy_tracked_buffer tracked_copy_buffers[VKD3D_BUFFER_COPY_TRACKING_BUFFER_COUNT];
@@ -3081,6 +3120,25 @@ struct d3d12_command_list
 
 #ifdef VKD3D_ENABLE_BREADCRUMBS
     unsigned int breadcrumb_context_index;
+#endif
+
+#ifdef VKD3D_ENABLE_PROFILING
+    struct
+    {
+        struct d3d12_pipeline_state *active_timestamp_state;
+        size_t timestamp_index;
+
+        struct vkd3d_timestamp_profiler_submitted_work *work;
+        size_t work_count;
+        size_t work_size;
+
+        /* When a commandlist is submitted multiple times,
+         * we need to make sure the worker thread has observed the previous submission's timestamp
+         * before we resubmit. */
+        uint64_t resubmit_timeline;
+
+        uint32_t dispatch_count;
+    } timestamp_profiler;
 #endif
 };
 
@@ -3282,6 +3340,9 @@ struct d3d12_command_queue_submission_execute
 
     struct vkd3d_initial_transition *transitions;
     size_t transition_count;
+
+    struct d3d12_resource **retained_resources;
+    UINT num_retained_resources;
 
 #ifdef VKD3D_ENABLE_BREADCRUMBS
     /* Replays commands in submission order for heavy debug. */
@@ -3847,7 +3908,7 @@ static inline void vkd3d_breadcrumb_image(
 {
     const D3D12_RESOURCE_DESC1 *desc = &resource->desc;
     VKD3D_BREADCRUMB_TAG("ImageDesc [Cookie, DXGI_FORMAT, D3D12_RESOURCE_DIMENSION, width, height, DepthOrArraySize, MipLevels, Flags]");
-    VKD3D_BREADCRUMB_COOKIE(resource->res.cookie);
+    VKD3D_BREADCRUMB_COOKIE(resource->res.cookie.index);
     VKD3D_BREADCRUMB_AUX32(desc->Format);
     VKD3D_BREADCRUMB_AUX32(desc->Dimension);
     VKD3D_BREADCRUMB_AUX64(desc->Width);
@@ -3863,8 +3924,8 @@ static inline void vkd3d_breadcrumb_buffer(
     VKD3D_BREADCRUMB_TAG("BufferDesc [VkBuffer VA, SuballocatedOffset, Cookie, GlobalCookie, Size, Flags]");
     VKD3D_BREADCRUMB_AUX64(resource->mem.resource.va);
     VKD3D_BREADCRUMB_AUX64(resource->mem.offset);
-    VKD3D_BREADCRUMB_COOKIE(resource->res.cookie);
-    VKD3D_BREADCRUMB_COOKIE(resource->mem.resource.cookie);
+    VKD3D_BREADCRUMB_COOKIE(resource->res.cookie.index);
+    VKD3D_BREADCRUMB_COOKIE(resource->mem.resource.cookie.index);
     VKD3D_BREADCRUMB_AUX64(resource->desc.Width);
     VKD3D_BREADCRUMB_AUX32(resource->desc.Flags);
 }
@@ -4917,6 +4978,7 @@ typedef ID3D12Device12 d3d12_device_iface;
 
 struct vkd3d_descriptor_qa_global_info;
 struct vkd3d_descriptor_qa_heap_buffer_data;
+struct vkd3d_timestamp_profiler;
 
 /* ID3D12DeviceExt */
 typedef ID3D12DeviceExt1 d3d12_device_vkd3d_ext_iface;
@@ -5252,6 +5314,9 @@ struct d3d12_device
 #endif
 #ifdef VKD3D_ENABLE_DESCRIPTOR_QA
     struct vkd3d_descriptor_qa_global_info *descriptor_qa_global_info;
+#endif
+#ifdef VKD3D_ENABLE_PROFILING
+    struct vkd3d_timestamp_profiler *timestamp_profiler;
 #endif
     uint64_t shader_interface_key;
     uint32_t device_has_dgc_templates;

@@ -228,6 +228,15 @@ struct vkd3d_shader_descriptor_table_buffer
     unsigned int count;  /* number of tables */
 };
 
+struct vkd3d_shader_root_parameter_mapping
+{
+    unsigned int root_parameter;
+    unsigned int offset;
+    unsigned int vk_set;
+    unsigned int vk_binding;
+    bool descriptor;
+};
+
 enum vkd3d_shader_interface_flag
 {
     VKD3D_SHADER_INTERFACE_PUSH_CONSTANTS_AS_UNIFORM_BUFFER    = 0x00000001u,
@@ -302,6 +311,12 @@ struct vkd3d_shader_interface_info
     /* Used for either VKD3D_SHADER_INTERFACE_RAW_VA_ALIAS_DESCRIPTOR_BUFFER or local root signatures. */
     uint32_t descriptor_size_cbv_srv_uav;
     uint32_t descriptor_size_sampler;
+
+    /* Purely for debug. Only non-NULL when running with EXTENDED_DEBUG_UTILS. */
+    const struct vkd3d_shader_root_parameter_mapping *root_parameter_mappings;
+    unsigned int root_parameter_mapping_count;
+    const void *root_signature_blob;
+    size_t root_signature_blob_size;
 };
 
 struct vkd3d_shader_descriptor_table
@@ -403,6 +418,7 @@ enum vkd3d_shader_target_extension
     VKD3D_SHADER_TARGET_EXTENSION_OPACITY_MICROMAP,
     VKD3D_SHADER_TARGET_EXTENSION_WMMA_FP8,
     VKD3D_SHADER_TARGET_EXTENSION_NV_COOPMAT2_CONVERSIONS,
+    VKD3D_SHADER_TARGET_EXTENSION_EXTENDED_NON_SEMANTIC,
     VKD3D_SHADER_TARGET_EXTENSION_COUNT,
 };
 
@@ -551,22 +567,6 @@ struct vkd3d_shader_compile_arguments
     /* Only non-zero when enabled by vkd3d_config */
     VkDriverId driver_id;
     uint32_t driver_version;
-};
-
-enum vkd3d_tessellator_output_primitive
-{
-    VKD3D_TESSELLATOR_OUTPUT_POINT        = 1,
-    VKD3D_TESSELLATOR_OUTPUT_LINE         = 2,
-    VKD3D_TESSELLATOR_OUTPUT_TRIANGLE_CW  = 3,
-    VKD3D_TESSELLATOR_OUTPUT_TRIANGLE_CCW = 4,
-};
-
-enum vkd3d_tessellator_partitioning
-{
-    VKD3D_TESSELLATOR_PARTITIONING_INTEGER         = 1,
-    VKD3D_TESSELLATOR_PARTITIONING_POW2            = 2,
-    VKD3D_TESSELLATOR_PARTITIONING_FRACTIONAL_ODD  = 3,
-    VKD3D_TESSELLATOR_PARTITIONING_FRACTIONAL_EVEN = 4,
 };
 
 /* root signature 1.0 */
@@ -880,30 +880,6 @@ struct vkd3d_versioned_root_signature_desc
     };
 };
 
-enum vkd3d_shader_uav_flag
-{
-    VKD3D_SHADER_UAV_FLAG_READ_ACCESS     = 0x00000001,
-    VKD3D_SHADER_UAV_FLAG_ATOMIC_COUNTER  = 0x00000002,
-    VKD3D_SHADER_UAV_FLAG_ATOMIC_ACCESS   = 0x00000004,
-    VKD3D_SHADER_UAV_FLAG_WRITE_ACCESS    = 0x00000008,
-};
-
-struct vkd3d_shader_scan_info
-{
-    struct hash_map register_map;
-    bool use_vocp;
-
-    bool early_fragment_tests;
-    bool has_side_effects;
-    bool needs_late_zs;
-    bool discards;
-    bool has_uav_counter;
-    bool declares_globally_coherent_uav;
-    bool requires_thread_group_uav_coherency;
-    bool requires_rov;
-    unsigned int patch_vertex_count;
-};
-
 enum vkd3d_component_type
 {
     VKD3D_TYPE_VOID    = 0,
@@ -987,8 +963,6 @@ struct vkd3d_shader_signature
 #define VKD3D_NO_SWIZZLE \
         VKD3D_SWIZZLE(VKD3D_SWIZZLE_X, VKD3D_SWIZZLE_Y, VKD3D_SWIZZLE_Z, VKD3D_SWIZZLE_W)
 
-#ifndef VKD3D_SHADER_NO_PROTOTYPES
-
 int vkd3d_shader_compile_dxbc(const struct vkd3d_shader_code *dxbc,
         struct vkd3d_shader_code *spirv, struct vkd3d_shader_code_debug *spirv_debug,
         unsigned int compiler_options,
@@ -997,6 +971,7 @@ int vkd3d_shader_compile_dxbc(const struct vkd3d_shader_code *dxbc,
 void vkd3d_shader_free_shader_code(struct vkd3d_shader_code *code);
 void vkd3d_shader_free_shader_code_debug(struct vkd3d_shader_code_debug *code);
 
+bool vkd3d_shader_contains_root_signature(const void *code, size_t size);
 int vkd3d_shader_parse_root_signature(const struct vkd3d_shader_code *dxbc,
         struct vkd3d_versioned_root_signature_desc *root_signature,
         vkd3d_shader_hash_t *compatibility_hash);
@@ -1011,9 +986,6 @@ int vkd3d_shader_serialize_root_signature(const struct vkd3d_versioned_root_sign
 
 int vkd3d_shader_convert_root_signature(struct vkd3d_versioned_root_signature_desc *dst,
         enum vkd3d_root_signature_version version, const struct vkd3d_versioned_root_signature_desc *src);
-
-int vkd3d_shader_scan_dxbc(const struct vkd3d_shader_code *dxbc,
-        struct vkd3d_shader_scan_info *scan_info);
 
 int vkd3d_shader_parse_input_signature(const struct vkd3d_shader_code *dxbc,
         struct vkd3d_shader_signature *signature);
@@ -1184,39 +1156,6 @@ uint32_t vkd3d_shader_compile_arguments_select_quirks(
         const struct vkd3d_shader_compile_arguments *args, vkd3d_shader_hash_t hash);
 
 uint64_t vkd3d_shader_get_revision(void);
-
-#endif  /* VKD3D_SHADER_NO_PROTOTYPES */
-
-/*
- * Function pointer typedefs for vkd3d-shader functions.
- */
-typedef int (*PFN_vkd3d_shader_compile_dxbc)(const struct vkd3d_shader_code *dxbc,
-        struct vkd3d_shader_code *spirv, struct vkd3d_shader_code_debug *spirv_debug,
-        unsigned int compiler_options,
-        const struct vkd3d_shader_interface_info *shader_interface_info,
-        const struct vkd3d_shader_compile_arguments *compile_args);
-typedef void (*PFN_vkd3d_shader_free_shader_code)(struct vkd3d_shader_code *code);
-
-typedef int (*PFN_vkd3d_shader_parse_root_signature)(const struct vkd3d_shader_code *dxbc,
-        struct vkd3d_versioned_root_signature_desc *root_signature,
-        vkd3d_shader_hash_t *compatibility_hash);
-typedef void (*PFN_vkd3d_shader_free_root_signature)(struct vkd3d_versioned_root_signature_desc *root_signature);
-
-typedef int (*PFN_vkd3d_shader_serialize_root_signature)(
-        const struct vkd3d_versioned_root_signature_desc *root_signature, struct vkd3d_shader_code *dxbc);
-
-typedef int (*PFN_vkd3d_shader_convert_root_signature)(struct vkd3d_versioned_root_signature_desc *dst,
-        enum vkd3d_root_signature_version version, const struct vkd3d_versioned_root_signature_desc *src);
-
-typedef int (*PFN_vkd3d_shader_scan_dxbc)(const struct vkd3d_shader_code *dxbc,
-        struct vkd3d_shader_scan_info *scan_info);
-
-typedef int (*PFN_vkd3d_shader_parse_input_signature)(const struct vkd3d_shader_code *dxbc,
-        struct vkd3d_shader_signature *signature);
-typedef struct vkd3d_shader_signature_element * (*PFN_vkd3d_shader_find_signature_element)(
-        const struct vkd3d_shader_signature *signature, const char *semantic_name,
-        unsigned int semantic_index, unsigned int stream_index);
-typedef void (*PFN_vkd3d_shader_free_shader_signature)(struct vkd3d_shader_signature *signature);
 
 int vkd3d_shader_parse_root_signature_v_1_0(const struct vkd3d_shader_code *dxbc,
         struct vkd3d_versioned_root_signature_desc *desc,
