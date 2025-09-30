@@ -4027,14 +4027,14 @@ static void d3d12_command_list_discard_attachment_barrier(struct d3d12_command_l
             (resource->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET))
     {
         stages = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-        access = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+        access = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT;
         layout = d3d12_resource_pick_layout(resource, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     }
     else if ((list->type == D3D12_COMMAND_LIST_TYPE_DIRECT) &&
             (resource->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
     {
         stages = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
-        access = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        access = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
         layout = is_bound && list->dsv_layout ?
                 list->dsv_layout :
                 d3d12_command_list_get_depth_stencil_resource_layout(list, resource, NULL);
@@ -7129,6 +7129,7 @@ static void d3d12_command_list_check_render_pass_barrier(struct d3d12_command_li
         if (list->cmd.clear_uav_pending)
         {
             vk_barrier = &vk_barriers[dep_info.memoryBarrierCount++];
+            vk_barrier->sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
             vk_barrier->srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
             vk_barrier->srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
             vk_barrier->dstStageMask = VK_PIPELINE_STAGE_2_PRE_RASTERIZATION_SHADERS_BIT |
@@ -12307,7 +12308,11 @@ static void d3d12_command_list_clear_uav(struct d3d12_command_list *list,
         }
     }
 
-    if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_CLEAR_UAV_SYNC)
+    /* Applications are supposed to use barriers here, but native drivers inherited some
+     * very unfortunate behavior from 11on12 where ClearUAV are implicitly barriers, similar to how
+     * transfer ops work. Too many cases in the wild where this stuff just breaks,
+     * so be conservative. */
+    if (!(vkd3d_config_flags & VKD3D_CONFIG_FLAG_NO_CLEAR_UAV_SYNC))
         list->cmd.clear_uav_pending = true;
 
     d3d12_command_list_debug_mark_end_region(list);
@@ -20483,7 +20488,7 @@ static void d3d12_command_queue_acquire_serialized(struct d3d12_command_queue *q
     current_drain = ++queue->drain_count;
     d3d12_command_queue_add_submission_locked(queue, &sub);
 
-    while (current_drain != queue->queue_drain_count)
+    while (current_drain > queue->queue_drain_count)
         pthread_cond_wait(&queue->queue_cond, &queue->queue_lock);
 }
 
@@ -20808,6 +20813,25 @@ VkQueue vkd3d_acquire_vk_queue(ID3D12CommandQueue *queue)
     VKD3D_REGION_END(acquire_vk_queue);
 
     return vk_queue;
+}
+
+VkQueue vkd3d_lock_vk_queue(ID3D12CommandQueue *queue)
+{
+    struct d3d12_command_queue *d3d12_queue = impl_from_ID3D12CommandQueue(queue);
+    VkQueue vk_queue;
+
+    VKD3D_REGION_DECL(lock_vk_queue);
+    VKD3D_REGION_BEGIN(lock_vk_queue);
+    vk_queue = vkd3d_queue_acquire(d3d12_queue->vkd3d_queue);
+    VKD3D_REGION_END(lock_vk_queue);
+    return vk_queue;
+}
+
+void vkd3d_unlock_vk_queue(ID3D12CommandQueue *queue)
+{
+    struct d3d12_command_queue *d3d12_queue = impl_from_ID3D12CommandQueue(queue);
+
+    vkd3d_queue_release(d3d12_queue->vkd3d_queue);
 }
 
 void vkd3d_release_vk_queue(ID3D12CommandQueue *queue)

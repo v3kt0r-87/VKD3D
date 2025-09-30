@@ -106,7 +106,7 @@ extern "C" {
 #define VKD3D_CONFIG_FLAG_DRIVER_VERSION_SENSITIVE_SHADERS (1ull << 48)
 #define VKD3D_CONFIG_FLAG_SMALL_VRAM_REBAR (1ull << 49)
 #define VKD3D_CONFIG_FLAG_NO_STAGGERED_SUBMIT (1ull << 50)
-#define VKD3D_CONFIG_FLAG_CLEAR_UAV_SYNC (1ull << 51)
+#define VKD3D_CONFIG_FLAG_NO_CLEAR_UAV_SYNC (1ull << 51)
 #define VKD3D_CONFIG_FLAG_FORCE_DYNAMIC_MSAA (1ull << 52)
 #define VKD3D_CONFIG_FLAG_INSTRUCTION_QA_CHECKS (1ull << 53)
 #define VKD3D_CONFIG_FLAG_TRANSFER_QUEUE (1ull << 54)
@@ -116,7 +116,7 @@ extern "C" {
 #define VKD3D_CONFIG_FLAG_QUEUE_PROFILE_EXTRA (1ull << 58)
 #define VKD3D_CONFIG_FLAG_DAMAGE_NOT_ZEROED_ALLOCATIONS (1ull << 59)
 #define VKD3D_CONFIG_FLAG_DEFER_RESOURCE_DESTRUCTION (1ull << 60)
-#define VKD3D_CONFIG_FLAG_DISABLE_DXBC_SPIRV (1ull << 61)
+/* Bit 61 is vacant */
 #define VKD3D_CONFIG_FLAG_EXTENDED_DEBUG_UTILS (1ull << 62)
 
 struct vkd3d_instance;
@@ -178,6 +178,8 @@ uint32_t vkd3d_get_vk_queue_index(ID3D12CommandQueue *queue);
 uint32_t vkd3d_get_vk_queue_flags(ID3D12CommandQueue *queue);
 VkQueue vkd3d_acquire_vk_queue(ID3D12CommandQueue *queue);
 void vkd3d_release_vk_queue(ID3D12CommandQueue *queue);
+VkQueue vkd3d_lock_vk_queue(ID3D12CommandQueue *queue);
+void vkd3d_unlock_vk_queue(ID3D12CommandQueue *queue);
 void vkd3d_enqueue_initial_transition(ID3D12CommandQueue *queue, ID3D12Resource *resource);
 
 HRESULT vkd3d_create_image_resource(ID3D12Device *device,
