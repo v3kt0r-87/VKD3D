@@ -68,8 +68,15 @@
 
 #define VKD3D_TILE_SIZE (65536ull)
 
+/* Align all buffers to 256 to meet requirements for RTAS. Native drivers don't do this,
+ * but intended interactions are unclear. This is the maximum allowed buffer alignment
+ * per D3D12 spec. */
+#define VKD3D_MIN_BUFFER_ALIGNMENT (256u)
+
 /* Minimum required maxBufferSize in Vulkan */
 #define VKD3D_MAX_FILL_BUFFER_SIZE (1ull << 30)
+
+typedef UINT D3DKMT_HANDLE;
 
 typedef ID3D12Fence1 d3d12_fence_iface;
 
@@ -140,6 +147,7 @@ struct vkd3d_vulkan_info
     bool KHR_compute_shader_derivatives;
     bool KHR_calibrated_timestamps;
     bool KHR_cooperative_matrix;
+    bool KHR_unified_image_layouts;
     /* EXT device extensions */
     bool EXT_conditional_rendering;
     bool EXT_conservative_rasterization;
@@ -664,6 +672,7 @@ struct d3d12_shared_fence
     D3D12_FENCE_FLAGS d3d12_flags;
 
     VkSemaphore timeline_semaphore;
+    D3DKMT_HANDLE kmt_local;
 
     pthread_t thread;
     pthread_mutex_t mutex;
@@ -1047,6 +1056,13 @@ struct vkd3d_view_map
 #endif
 };
 
+struct vkd3d_sampler_view_map
+{
+    struct vkd3d_view_map map;
+    uint32_t custom_border_color_count;
+    uint32_t live_object_count;
+};
+
 HRESULT vkd3d_view_map_init(struct vkd3d_view_map *view_map);
 void vkd3d_view_map_destroy(struct vkd3d_view_map *view_map, struct d3d12_device *device);
 
@@ -1081,6 +1097,7 @@ struct d3d12_resource
     struct vkd3d_memory_allocation mem;
     struct vkd3d_memory_allocation private_mem;
     struct vkd3d_unique_resource res;
+    D3DKMT_HANDLE kmt_local;
 
     struct d3d12_heap *heap;
 
@@ -2491,6 +2508,7 @@ struct d3d12_descriptor_pool_cache
 
 #define VKD3D_SCRATCH_BUFFER_SIZE_DEFAULT (1ull << 20)
 #define VKD3D_SCRATCH_BUFFER_SIZE_DGCC_PREPROCESS_NV (32ull << 20)
+#define VKD3D_SCRATCH_BUFFER_SIZE_PREPROCESS_NV (4ull << 20)
 #define VKD3D_SCRATCH_BUFFER_COUNT_DEFAULT (32u)
 #define VKD3D_SCRATCH_BUFFER_COUNT_INDIRECT_PREPROCESS (128u)
 #define VKD3D_MAX_SCRATCH_BUFFER_COUNT (128u)
@@ -2816,6 +2834,7 @@ struct vkd3d_image_copy_info
     bool overlapping_subresource;
     VkImageLayout src_layout;
     VkImageLayout dst_layout;
+    VkDeviceSize buffer_footprint_size;
 };
 
 struct vkd3d_query_resolve_entry
@@ -2856,6 +2875,9 @@ struct d3d12_transfer_batch_state
     enum vkd3d_batch_type batch_type;
     struct vkd3d_image_copy_info batch[VKD3D_COPY_TEXTURE_REGION_MAX_BATCH_SIZE];
     size_t batch_len;
+
+    struct d3d12_buffer_copy_tracked_buffer tracked_copy_buffers[VKD3D_BUFFER_COPY_TRACKING_BUFFER_COUNT];
+    unsigned int tracked_copy_buffer_count;
 };
 
 #define VKD3D_MAX_WBI_BATCH_SIZE 128
@@ -3106,9 +3128,6 @@ struct d3d12_command_list
     size_t retained_resources_count;
 
     struct hash_map query_resolve_lut;
-
-    struct d3d12_buffer_copy_tracked_buffer tracked_copy_buffers[VKD3D_BUFFER_COPY_TRACKING_BUFFER_COUNT];
-    unsigned int tracked_copy_buffer_count;
 
     struct d3d12_transfer_batch_state transfer_batch;
     struct d3d12_wbi_batch_state wbi_batch;
@@ -4882,6 +4901,7 @@ struct vkd3d_physical_device_info
     VkPhysicalDeviceShaderFloat8FeaturesEXT shader_float8_features;
     VkPhysicalDeviceCooperativeMatrix2FeaturesNV cooperative_matrix2_features_nv;
     VkPhysicalDeviceAntiLagFeaturesAMD anti_lag_amd;
+    VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR unified_image_layouts_features;
 
     VkPhysicalDeviceFeatures2 features2;
 
@@ -4915,6 +4935,7 @@ struct d3d12_caps
     D3D12_FEATURE_DATA_D3D12_OPTIONS19 options19;
     D3D12_FEATURE_DATA_D3D12_OPTIONS20 options20;
     D3D12_FEATURE_DATA_D3D12_OPTIONS21 options21;
+    D3D12_FEATURE_DATA_TIGHT_ALIGNMENT tight_alignment;
 
     D3D_FEATURE_LEVEL max_feature_level;
     D3D_SHADER_MODEL max_shader_model;
@@ -5035,6 +5056,8 @@ enum vkd3d_queue_timeline_trace_state_type
     VKD3D_QUEUE_TIMELINE_TRACE_STATE_TYPE_VK_ALLOCATE_MEMORY,
     VKD3D_QUEUE_TIMELINE_TRACE_STATE_TYPE_CLEAR_ALLOCATION,
     VKD3D_QUEUE_TIMELINE_TRACE_STATE_TYPE_COMMAND_ALLOCATOR_RESET,
+
+    VKD3D_QUEUE_TIMELINE_TRACE_STATE_TYPE_CPU_SIGNAL,
 };
 
 struct vkd3d_queue_timeline_trace_state
@@ -5083,6 +5106,8 @@ vkd3d_queue_timeline_trace_register_event_signal(struct vkd3d_queue_timeline_tra
         vkd3d_native_sync_handle handle, d3d12_fence_iface *fence, uint64_t value);
 struct vkd3d_queue_timeline_trace_cookie
 vkd3d_queue_timeline_trace_register_signal(struct vkd3d_queue_timeline_trace *trace,
+        d3d12_fence_iface *fence, uint64_t value);
+void vkd3d_queue_timeline_trace_cpu_signal(struct vkd3d_queue_timeline_trace *trace,
         d3d12_fence_iface *fence, uint64_t value);
 struct vkd3d_queue_timeline_trace_cookie
 vkd3d_queue_timeline_trace_register_wait(struct vkd3d_queue_timeline_trace *trace,
@@ -5263,6 +5288,7 @@ struct d3d12_device
 
     IUnknown *parent;
     LUID adapter_luid;
+    D3DKMT_HANDLE kmt_local;
 
     struct vkd3d_private_store private_store;
     struct d3d_destruction_notifier destruction_notifier;
@@ -5299,7 +5325,7 @@ struct d3d12_device
     struct vkd3d_queue_timeline_trace queue_timeline_trace;
     struct vkd3d_memory_info memory_info;
     struct vkd3d_meta_ops meta_ops;
-    struct vkd3d_view_map sampler_map;
+    struct vkd3d_sampler_view_map sampler_map;
     struct vkd3d_sampler_state sampler_state;
     struct vkd3d_shader_debug_ring debug_ring;
     struct vkd3d_pipeline_library_disk_cache disk_cache;
@@ -6220,6 +6246,12 @@ static inline unsigned int d3d12_resource_get_sub_resource_count(const struct d3
             (resource->format ? vkd3d_popcount(resource->format->vk_aspect_mask) : 1);
 }
 
+static inline uint32_t d3d12_resource_desc_default_alignment(const D3D12_RESOURCE_DESC1 *desc)
+{
+    return desc->SampleDesc.Count > 1 ?
+           D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+}
+
 static inline void vkd3d_get_depth_bias_representation(VkDepthBiasRepresentationInfoEXT *info,
         const struct d3d12_device *device, DXGI_FORMAT dsv_format)
 {
@@ -6430,6 +6462,64 @@ typedef enum D3D11_RESOURCE_MISC_FLAG
     D3D11_RESOURCE_MISC_TILED                            = 0x40000,
     D3D11_RESOURCE_MISC_HW_PROTECTED                     = 0x80000,
 } D3D11_RESOURCE_MISC_FLAG;
+
+typedef enum D3D11_RESOURCE_DIMENSION
+{
+    D3D11_RESOURCE_DIMENSION_UNKNOWN,
+    D3D11_RESOURCE_DIMENSION_BUFFER,
+    D3D11_RESOURCE_DIMENSION_TEXTURE1D,
+    D3D11_RESOURCE_DIMENSION_TEXTURE2D,
+    D3D11_RESOURCE_DIMENSION_TEXTURE3D,
+} D3D11_RESOURCE_DIMENSION;
+
+typedef struct D3D11_BUFFER_DESC
+{
+    UINT ByteWidth;
+    D3D11_USAGE Usage;
+    UINT BindFlags;
+    UINT CPUAccessFlags;
+    UINT MiscFlags;
+    UINT StructureByteStride;
+} D3D11_BUFFER_DESC;
+
+typedef struct D3D11_TEXTURE1D_DESC
+{
+    UINT Width;
+    UINT MipLevels;
+    UINT ArraySize;
+    DXGI_FORMAT Format;
+    D3D11_USAGE Usage;
+    UINT BindFlags;
+    UINT CPUAccessFlags;
+    UINT MiscFlags;
+} D3D11_TEXTURE1D_DESC;
+
+typedef struct D3D11_TEXTURE2D_DESC
+{
+    UINT Width;
+    UINT Height;
+    UINT MipLevels;
+    UINT ArraySize;
+    DXGI_FORMAT Format;
+    DXGI_SAMPLE_DESC SampleDesc;
+    D3D11_USAGE Usage;
+    UINT BindFlags;
+    UINT CPUAccessFlags;
+    UINT MiscFlags;
+} D3D11_TEXTURE2D_DESC;
+
+typedef struct D3D11_TEXTURE3D_DESC
+{
+    UINT Width;
+    UINT Height;
+    UINT Depth;
+    UINT MipLevels;
+    DXGI_FORMAT Format;
+    D3D11_USAGE Usage;
+    UINT BindFlags;
+    UINT CPUAccessFlags;
+    UINT MiscFlags;
+} D3D11_TEXTURE3D_DESC;
 
 struct DxvkSharedTextureMetadata {
     UINT             Width;

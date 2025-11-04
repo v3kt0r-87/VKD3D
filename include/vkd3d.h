@@ -116,7 +116,7 @@ extern "C" {
 #define VKD3D_CONFIG_FLAG_QUEUE_PROFILE_EXTRA (1ull << 58)
 #define VKD3D_CONFIG_FLAG_DAMAGE_NOT_ZEROED_ALLOCATIONS (1ull << 59)
 #define VKD3D_CONFIG_FLAG_DEFER_RESOURCE_DESTRUCTION (1ull << 60)
-/* Bit 61 is vacant */
+#define VKD3D_CONFIG_FLAG_PREFER_THIN_UAV_TILING (1ull << 61)
 #define VKD3D_CONFIG_FLAG_EXTENDED_DEBUG_UTILS (1ull << 62)
 
 struct vkd3d_instance;
@@ -182,8 +182,6 @@ VkQueue vkd3d_lock_vk_queue(ID3D12CommandQueue *queue);
 void vkd3d_unlock_vk_queue(ID3D12CommandQueue *queue);
 void vkd3d_enqueue_initial_transition(ID3D12CommandQueue *queue, ID3D12Resource *resource);
 
-HRESULT vkd3d_create_image_resource(ID3D12Device *device,
-        const struct vkd3d_image_resource_create_info *create_info, ID3D12Resource **resource);
 ULONG vkd3d_resource_decref(ID3D12Resource *resource);
 ULONG vkd3d_resource_incref(ID3D12Resource *resource);
 

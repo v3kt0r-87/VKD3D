@@ -402,6 +402,8 @@ static inline unsigned int format_size(DXGI_FORMAT format)
             return 16;
         case DXGI_FORMAT_R16G16B16A16_TYPELESS:
         case DXGI_FORMAT_R16G16B16A16_FLOAT:
+        case DXGI_FORMAT_R16G16B16A16_UINT:
+        case DXGI_FORMAT_R16G16B16A16_SINT:
         case DXGI_FORMAT_R32G32_UINT:
         case DXGI_FORMAT_R32G32_SINT:
         case DXGI_FORMAT_R32G32_FLOAT:
@@ -1841,5 +1843,8 @@ union d3d12_view_instancing_subobject
     };
     void *dummy_align;
 };
+
+float half_to_float(uint16_t u16_value);
+uint16_t float_to_half(float v);
 
 #endif  /* __VKD3D_D3D12_TEST_UTILS_H */
